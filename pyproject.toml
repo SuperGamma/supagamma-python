@@ -1,0 +1,99 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "supagamma"
+dynamic = ["version"]
+description = "Official Python SDK for the SupaGamma API — historical data for prediction markets."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.9"
+authors = [{ name = "SupaGamma", email = "support@supagamma.com" }]
+keywords = [
+    "supagamma",
+    "prediction-markets",
+    "polymarket",
+    "kalshi",
+    "market-data",
+    "orderbook",
+    "historical-data",
+    "quant",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Financial and Insurance Industry",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Office/Business :: Financial :: Investment",
+    "Typing :: Typed",
+]
+
+# httpx only. It carries both the sync and async transports, so the two clients
+# share one dependency, and it is verified working against our Cloudflare front
+# (the monorepo's "Cloudflare rejects httpx" note is specific to Polymarket's
+# Gamma API, not ours).
+dependencies = ["httpx>=0.27,<1"]
+
+[project.optional-dependencies]
+# Parquet downloads come back as bytes regardless; these are only needed if you
+# want the SDK to hand you a DataFrame.
+pandas = ["pandas>=2.0", "pyarrow>=15"]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+    "respx>=0.21",
+    "mypy>=1.11",
+    "ruff>=0.6",
+]
+
+[project.urls]
+Homepage = "https://supagamma.com"
+Documentation = "https://supagamma.com/docs"
+Source = "https://github.com/SuperGamma/supagamma-python"
+Issues = "https://github.com/SuperGamma/supagamma-python/issues"
+
+[tool.hatch.version]
+path = "src/supagamma/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/supagamma"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+filterwarnings = ["error"]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = [
+    # PEP 604 (`X | Y`) is not evaluatable at runtime on 3.9, and several of
+    # these annotations ARE evaluated (module-level type aliases, dataclass
+    # fields). Keep typing.Optional/Union.
+    "UP007",
+    "UP045",
+    # PEP 585 (`dict` over `typing.Dict`) is valid on our 3.9 floor, but the
+    # rewrite touches ~230 sites across every module and we have no 3.9
+    # interpreter in the local loop to prove the result still imports there.
+    # The typing-module spellings are unambiguous and cost nothing at runtime,
+    # so this stays until CI can verify the change on 3.9 itself.
+    "UP006",
+    "UP035",
+]
+
+[tool.mypy]
+python_version = "3.9"
+strict = true
+warn_unreachable = true
+files = ["src/supagamma"]

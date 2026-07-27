@@ -1,0 +1,71 @@
+# Publish to PyPI via Trusted Publishing (OIDC) — no API token stored anywhere.
+#
+# ONE-TIME SETUP before the first release, at https://pypi.org/manage/account/publishing/
+#   PyPI project name: supagamma
+#   Owner:             SuperGamma
+#   Repository name:   supagamma-python
+#   Workflow name:     publish.yml
+#   Environment name:  pypi
+#
+# Until that publisher is registered, this workflow will fail at the upload step
+# with "not a trusted publisher" — which is the intended safe default. Nothing
+# can reach PyPI by accident.
+#
+# To cut a release: bump __version__ in src/supagamma/__init__.py, commit, then
+# push a matching tag (v0.1.0). The tag is the trigger; the job refuses to run
+# if the tag and the package version disagree.
+
+name: Publish
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install build twine
+
+      - name: Tag must match the package version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          PKG=$(python -c "import re,pathlib; print(re.search(r'__version__ = \"([^\"]+)\"', pathlib.Path('src/supagamma/__init__.py').read_text()).group(1))")
+          if [ "$TAG" != "$PKG" ]; then
+            echo "::error::tag v$TAG does not match __version__ $PKG"
+            exit 1
+          fi
+          echo "releasing $PKG"
+
+      - run: python -m build
+      - run: twine check dist/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    # A protected environment means a human approves the first upload under any
+    # given version, which is the only irreversible step in the whole pipeline —
+    # PyPI does not allow re-uploading a version that already exists.
+    environment:
+      name: pypi
+      url: https://pypi.org/p/supagamma
+    permissions:
+      id-token: write # required for Trusted Publishing
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
