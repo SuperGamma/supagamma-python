@@ -77,9 +77,7 @@ def test_raw_and_bulk_are_never_retried():
     from datetime import datetime, timezone
 
     now = datetime(2026, 1, 1, tzinfo=timezone.utc)
-    assert download.build_raw(
-        data_type="polymarket_trades", start=now, end=now
-    )[3] is NEVER
+    assert download.build_raw(data_type="polymarket_trades", start=now, end=now)[3] is NEVER
     assert download.build_bulk()[3] is NEVER
 
 

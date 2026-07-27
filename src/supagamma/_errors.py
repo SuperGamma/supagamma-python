@@ -481,8 +481,10 @@ def parse_error(
             and "direct origin access" in detail.lower()
         ):
             cls = OriginBlockedError
-        elif status_code == 404 and isinstance(detail, str) and any(
-            m in detail.lower() for m in _NO_DATA_MARKERS
+        elif (
+            status_code == 404
+            and isinstance(detail, str)
+            and any(m in detail.lower() for m in _NO_DATA_MARKERS)
         ):
             cls = NoDataInRangeError
         elif status_code == 502:

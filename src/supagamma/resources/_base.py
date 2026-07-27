@@ -40,9 +40,7 @@ class SyncResource:
 
     def _json(self, spec: Call, *, json: Any = None) -> Any:
         method, path, params, policy = spec
-        return self._client.request(
-            method, path, params=params, json=json, policy=policy
-        ).json()
+        return self._client.request(method, path, params=params, json=json, policy=policy).json()
 
     def _raw(self, spec: Call, *, json: Any = None) -> Any:
         method, path, params, policy = spec
@@ -55,9 +53,7 @@ class AsyncResource:
 
     async def _json(self, spec: Call, *, json: Any = None) -> Any:
         method, path, params, policy = spec
-        response = await self._client.request(
-            method, path, params=params, json=json, policy=policy
-        )
+        response = await self._client.request(method, path, params=params, json=json, policy=policy)
         return response.json()
 
     async def _raw(self, spec: Call, *, json: Any = None) -> Any:

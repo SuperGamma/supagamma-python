@@ -37,9 +37,7 @@ __all__ = [
 MAX_LIMIT = 5000
 
 
-def build_list(
-    *, limit: int = 500, offset: int = 0, resolved: Optional[bool] = None
-) -> Call:
+def build_list(*, limit: int = 500, offset: int = 0, resolved: Optional[bool] = None) -> Call:
     return call(
         "GET",
         "/v1/public/markets",

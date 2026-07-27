@@ -78,9 +78,7 @@ def build_pricing() -> Call:
     return call("GET", "/v1/orders/estimate", {}, SAFE_READ)
 
 
-def _create_payload(
-    items: Sequence[OrderItem], idempotency_key: Optional[str]
-) -> Dict[str, Any]:
+def _create_payload(items: Sequence[OrderItem], idempotency_key: Optional[str]) -> Dict[str, Any]:
     if not items:
         raise ValueError("create() needs at least one item")
     if len(items) > MAX_ITEMS:

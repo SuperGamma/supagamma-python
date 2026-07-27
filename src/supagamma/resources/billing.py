@@ -137,9 +137,7 @@ def _check_tier(tier: str) -> str:
 
 def _check_billing_period(billing_period: str) -> str:
     if billing_period not in BILLING_PERIODS:
-        raise ValueError(
-            f"billing_period must be one of {BILLING_PERIODS}, got {billing_period!r}"
-        )
+        raise ValueError(f"billing_period must be one of {BILLING_PERIODS}, got {billing_period!r}")
     return billing_period
 
 
@@ -453,9 +451,7 @@ class Billing(SyncResource):
 
         Rate limited to 5/min on top of the global bucket.
         """
-        spec, body = build_checkout(
-            amount=amount, success_url=success_url, cancel_url=cancel_url
-        )
+        spec, body = build_checkout(amount=amount, success_url=success_url, cancel_url=cancel_url)
         data: Dict[str, Any] = self._json(spec, json=body)
         return data
 
@@ -474,9 +470,7 @@ class Billing(SyncResource):
         rows: List[Dict[str, Any]] = self._json(build_transactions(limit=limit, offset=offset))
         return rows
 
-    def iter_transactions(
-        self, *, limit: int = 50, offset: int = 0
-    ) -> Iterator[Dict[str, Any]]:
+    def iter_transactions(self, *, limit: int = 50, offset: int = 0) -> Iterator[Dict[str, Any]]:
         """Iterate transactions across pages, stopping on the first short page.
 
         Free reads, but offset pagination over a ``created_at DESC`` list is
@@ -590,17 +584,13 @@ class AsyncBilling(AsyncResource):
         """
         return payg_enabled(await self.pricing(refresh=refresh))
 
-    async def checkout(
-        self, *, amount: float, success_url: str, cancel_url: str
-    ) -> Dict[str, Any]:
+    async def checkout(self, *, amount: float, success_url: str, cancel_url: str) -> Dict[str, Any]:
         """Create a Paddle checkout to buy credits. **Not retried, ever.**
 
         See :meth:`Billing.checkout`. No idempotency key, 5/min tier, and the
         only route gated by ``SUBSCRIPTION_ONLY`` (410 ``payg_retired``).
         """
-        spec, body = build_checkout(
-            amount=amount, success_url=success_url, cancel_url=cancel_url
-        )
+        spec, body = build_checkout(amount=amount, success_url=success_url, cancel_url=cancel_url)
         data: Dict[str, Any] = await self._json(spec, json=body)
         return data
 

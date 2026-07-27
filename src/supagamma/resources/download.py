@@ -536,9 +536,7 @@ class Download(SyncResource):
         _maybe_warn_cost(limit, "trades", self.confirm_cost)
         return _to_result(
             self._raw(
-                build_trades(
-                    market_id=market_id, start=start, end=end, format=format, limit=limit
-                )
+                build_trades(market_id=market_id, start=start, end=end, format=format, limit=limit)
             )
         )
 
@@ -814,9 +812,7 @@ class AsyncDownload(AsyncResource):
         _maybe_warn_cost(limit, "trades", self.confirm_cost)
         return _to_result(
             await self._raw(
-                build_trades(
-                    market_id=market_id, start=start, end=end, format=format, limit=limit
-                )
+                build_trades(market_id=market_id, start=start, end=end, format=format, limit=limit)
             )
         )
 
