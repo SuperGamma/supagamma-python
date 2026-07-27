@@ -36,9 +36,10 @@ jobs:
         run: ruff format --check src tests
 
       - name: Types
+        # Once is enough, and on the NEWER leg: current mypy does not support a
+        # 3.9 target, so running it there fails on the toolchain, not the code.
         run: mypy
-        # 3.9 is the annotation floor we actually target; running mypy once is enough.
-        if: matrix.python-version == '3.9'
+        if: matrix.python-version == '3.13'
 
       - name: Tests
         run: pytest -q

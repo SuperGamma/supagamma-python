@@ -506,7 +506,7 @@ def parse_error(
     kwargs.update(_kwargs_from_detail(code, detail))
 
     try:
-        return cls(message, **kwargs)  # type: ignore[no-any-return, call-arg]
+        return cls(message, **kwargs)
     except TypeError:
         # A subclass whose signature we mismatched must never mask the real
         # error — degrade to the generic type instead of raising from here.
