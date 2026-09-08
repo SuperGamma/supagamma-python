@@ -42,6 +42,38 @@ Create one in your [dashboard](https://supagamma.com/dashboard/api-keys). Keys l
 | `client.system` | `/health`, platform stats |
 | `client.public_markets` | Public market metadata (usually disabled) |
 
+## Backtesting
+
+`supagamma.backtest` is a dependency-free harness for scoring prediction-market
+strategies against resolved markets — plus the calibration analysis behind the
+"does the favourite-longshot bias exist?" study. The engine takes no network, so
+it unit-tests offline; the `data` helper bridges it to a live client.
+
+```python
+from supagamma import SupaGamma
+from supagamma.backtest import Backtest, BetFavourite, calibration
+from supagamma.backtest.data import resolved_markets, calibration_pairs
+
+client = SupaGamma(api_key="sg_...")
+universe = list(resolved_markets(client, max_markets=1_000))
+
+# Is the market's price an honest probability?
+print(calibration(calibration_pairs(universe)).as_table())
+
+# Does backing the favourite beat the book?
+result = Backtest(bankroll=1_000).run(universe, BetFavourite(stake=10))
+print(result.summary())
+```
+
+The strategy only ever sees a `MarketView` with no outcome field, so it *cannot*
+peek at the answer — look-ahead safety is enforced, not trusted. Write your own
+by returning an `Order(side, stake)` (or `None`) from any callable. A full worked
+example lives in [`examples/calibration.py`](examples/calibration.py).
+
+It's a research tool, not investment advice, and makes no performance promise:
+it shows what *did* happen in historical data. Fees, liquidity, and slippage make
+live results different.
+
 ## Four things worth knowing
 
 These are properties of the API, not of this library, and the SDK surfaces them rather than hiding them.

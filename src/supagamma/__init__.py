@@ -20,7 +20,7 @@ Three things about this API that the SDK surfaces rather than hides:
 
 from __future__ import annotations
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 from ._client import AsyncSupaGamma, SupaGamma  # noqa: E402
 from ._errors import (  # noqa: E402
