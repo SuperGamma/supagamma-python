@@ -107,3 +107,10 @@ strict = true
 warn_return_any = false
 warn_unreachable = true
 files = ["src/supagamma"]
+
+[[tool.mypy.overrides]]
+# pyarrow comes only with the optional `pandas` extra. CI type-checks without
+# it, and the code imports it defensively, so a missing module is expected
+# rather than an error.
+module = ["pyarrow", "pyarrow.*"]
+ignore_missing_imports = true

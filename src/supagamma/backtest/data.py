@@ -136,11 +136,14 @@ def _vwap_from_parquet(content: bytes) -> Optional[float]:
         import pyarrow.parquet as pq
     except Exception:
         return None
+    # pyarrow is an optional extra, so whether mypy sees it depends on the
+    # environment: with it installed, read_table is an untyped call; without it
+    # (CI), `pq` is Any and the ignore is unused. `unused-ignore` covers both.
     try:
-        table = pq.read_table(io.BytesIO(content), columns=["price", "size"])  # type: ignore[no-untyped-call]
+        table = pq.read_table(io.BytesIO(content), columns=["price", "size"])  # type: ignore[no-untyped-call, unused-ignore]
     except Exception:
         try:
-            table = pq.read_table(io.BytesIO(content), columns=["price"])  # type: ignore[no-untyped-call]
+            table = pq.read_table(io.BytesIO(content), columns=["price"])  # type: ignore[no-untyped-call, unused-ignore]
         except Exception:
             return None
     prices = [float(x) for x in table.column("price").to_pylist() if x is not None]
