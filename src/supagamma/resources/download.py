@@ -779,9 +779,9 @@ class Download(SyncResource):
         the series family, not by caller intent, so picking by hand is a 400
         waiting to happen. This consults the catalogue instead.
         """
-        catalogue = self._client.series.list()  # type: ignore[attr-defined]
+        catalogue = self._client.series.list()
         row = next(
-            (r for r in catalogue if r.get("series_id") == series_id or r.get("id") == series_id),
+            (r for r in catalogue if r.get("series_id") == series_id),
             None,
         )
         if row is None:
@@ -977,9 +977,9 @@ class AsyncDownload(AsyncResource):
         return _to_bulk_result(await self._raw(build_bulk(), json=payload))
 
     async def for_series(self, series_id: str, **kwargs: Any) -> DownloadResult:
-        catalogue = await self._client.series.list()  # type: ignore[attr-defined]
+        catalogue = await self._client.series.list()
         row = next(
-            (r for r in catalogue if r.get("series_id") == series_id or r.get("id") == series_id),
+            (r for r in catalogue if r.get("series_id") == series_id),
             None,
         )
         if row is None:

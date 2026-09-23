@@ -37,6 +37,7 @@ PriceFn = Callable[["Any", Record], Optional[float]]
 # strings depending on the upstream venue.
 # --------------------------------------------------------------------------- #
 
+
 def _as_sequence(value: Any) -> Optional[Sequence[Any]]:
     if value is None:
         return None
@@ -81,7 +82,7 @@ def realized_outcome(market: Record) -> Optional[int]:
     if isinstance(win, bool):
         return 1 if win else 0
     if isinstance(win, int):
-        return 1 if win == 0 else 0                     # index 0 == YES leg
+        return 1 if win == 0 else 0  # index 0 == YES leg
     if isinstance(win, str):
         w = win.strip().lower()
         if w in ("yes", "true", "1"):
@@ -97,6 +98,7 @@ def realized_outcome(market: Record) -> Optional[int]:
 # --------------------------------------------------------------------------- #
 # The paid, honest entry price: VWAP from the trade tape before resolution.
 # --------------------------------------------------------------------------- #
+
 
 def vwap_price_fn(horizon_hours: float = 24.0, *, trade_limit: int = 100_000) -> PriceFn:
     """Build a price function that reads the trade tape (this **costs money**).
@@ -166,6 +168,7 @@ def _parse_dt(value: Any) -> Optional[datetime]:
 # --------------------------------------------------------------------------- #
 # The one entry point most callers use.
 # --------------------------------------------------------------------------- #
+
 
 def resolved_markets(
     client: Any,

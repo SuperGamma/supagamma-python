@@ -39,7 +39,7 @@ class MarketView:
 
     id: str
     question: str
-    prob: float                                   # implied P(YES) at entry
+    prob: float  # implied P(YES) at entry
     meta: Mapping[str, Any] = field(default_factory=dict)
 
 
@@ -56,7 +56,7 @@ class ResolvedMarket:
     """A market plus its realized outcome, used to settle bets."""
 
     view: MarketView
-    outcome: int                                  # realized 1 (YES) or 0 (NO)
+    outcome: int  # realized 1 (YES) or 0 (NO)
 
 
 class Strategy(Protocol):
@@ -80,7 +80,7 @@ def settle(price: float, stake: float, won: bool) -> float:
 class BetRecord:
     market_id: str
     side: int
-    price: float                                  # price of the side we bought
+    price: float  # price of the side we bought
     stake: float
     outcome: int
     pnl: float
@@ -207,6 +207,7 @@ class Backtest:
 # tools that show the API and the documented favourite-longshot effect.
 # --------------------------------------------------------------------------- #
 
+
 @dataclass
 class BetFavourite:
     """Back the side the market thinks is more likely, if it is confident enough.
@@ -215,7 +216,7 @@ class BetFavourite:
     systematically backing them is the textbook demonstration strategy.
     """
 
-    min_confidence: float = 0.60      # only bet when the favourite >= this
+    min_confidence: float = 0.60  # only bet when the favourite >= this
     stake: float = 10.0
 
     def __call__(self, m: MarketView) -> Optional[Order]:

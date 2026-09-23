@@ -98,12 +98,12 @@ ignore = [
 # floor is enforced where it actually bites — `from __future__ import
 # annotations` everywhere, plus the UP007/UP045 ruff rules.
 strict = true
-# The SDK deliberately hands back parsed JSON rather than typed response models
-# in 0.x — the API has no OpenAPI spec to generate from, and several routes have
-# no response_model server-side, so inventing types would be asserting a
-# contract the server does not actually guarantee. That makes the transport
-# helpers genuinely return Any, and warn_return_any then fires on ~55 correct
-# call sites. Revisit when typed models land; everything else stays strict.
+# Routes whose responses the API publishes a schema for return the TypedDicts in
+# `supagamma.types` (pinned to the spec by tests/test_types_contract.py). Routes
+# with no server-side response_model still return parsed JSON, because inventing
+# types there would assert a contract the server does not guarantee. The
+# transport helpers therefore genuinely return Any, and warn_return_any would
+# fire on every correct call site. Everything else stays strict.
 warn_return_any = false
 warn_unreachable = true
 files = ["src/supagamma"]

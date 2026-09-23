@@ -19,7 +19,7 @@ import re
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Dict, Mapping, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, Mapping, Optional, Tuple, Union
 
 import httpx
 
@@ -32,6 +32,17 @@ from ._errors import (
     SupaGammaConfigError,
     parse_error,
 )
+
+if TYPE_CHECKING:  # pragma: no cover - annotations only; no runtime import cycle
+    from .resources.account import Account, AsyncAccount
+    from .resources.billing import AsyncBilling, Billing
+    from .resources.download import AsyncDownload, Download
+    from .resources.markets import AsyncMarkets, Markets
+    from .resources.orders import AsyncOrders, Orders
+    from .resources.public_markets import AsyncPublicMarkets, PublicMarkets
+    from .resources.series import AsyncSeries, Series
+    from .resources.system import AsyncSystem, System
+    from .resources.trades import AsyncTrades, Trades
 
 DEFAULT_BASE_URL = "https://api.supagamma.com"
 
@@ -253,6 +264,21 @@ class SupaGamma(BaseClient):
     >>> markets = client.markets.list(limit=10)
     """
 
+    # Attached at runtime by `_attach_resources` (from `resources.NAMESPACES`).
+    # Declared here because type checkers cannot see attributes set by setattr:
+    # without these, every `client.<namespace>` call was `Any` to users, and none
+    # of the SDK's annotations or typed responses reached their editors.
+    # tests/test_types_contract.py keeps this list in step with NAMESPACES.
+    markets: Markets
+    public_markets: PublicMarkets
+    trades: Trades
+    series: Series
+    download: Download
+    orders: Orders
+    billing: Billing
+    account: Account
+    system: System
+
     def __init__(
         self, *args: Any, http_client: Optional[httpx.Client] = None, **kwargs: Any
     ) -> None:
@@ -343,6 +369,17 @@ class AsyncSupaGamma(BaseClient):
     >>> async with AsyncSupaGamma(api_key="sg_...") as client:
     ...     markets = await client.markets.list(limit=10)
     """
+
+    # See SupaGamma: declared so type checkers can see the runtime-attached namespaces.
+    markets: AsyncMarkets
+    public_markets: AsyncPublicMarkets
+    trades: AsyncTrades
+    series: AsyncSeries
+    download: AsyncDownload
+    orders: AsyncOrders
+    billing: AsyncBilling
+    account: AsyncAccount
+    system: AsyncSystem
 
     def __init__(
         self, *args: Any, http_client: Optional[httpx.AsyncClient] = None, **kwargs: Any

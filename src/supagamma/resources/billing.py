@@ -69,6 +69,7 @@ from typing import (
 )
 
 from .._client import NEVER, SAFE_READ
+from ..types import Balance, Checkout, Transaction
 from ._base import AsyncResource, Call, SyncResource, call
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -386,14 +387,14 @@ class Billing(SyncResource):
         self.subscription = BillingSubscription(client)
         self._pricing_cache: Optional[Dict[str, Any]] = None
 
-    def balance(self) -> Dict[str, Any]:
+    def balance(self) -> Balance:
         """Current credit balance. Free read.
 
         Never 404s: an account with no balance row gets an all-zero object, so
         **"new user" and "zero balance" are indistinguishable**. ``currency`` is
         hardcoded ``"USD"`` by the handler and is not a per-account setting.
         """
-        data: Dict[str, Any] = self._json(build_balance())
+        data: Balance = self._json(build_balance())
         return data
 
     def pricing(self, *, refresh: bool = False) -> Dict[str, Any]:
@@ -430,7 +431,7 @@ class Billing(SyncResource):
         """
         return payg_enabled(self.pricing(refresh=refresh))
 
-    def checkout(self, *, amount: float, success_url: str, cancel_url: str) -> Dict[str, Any]:
+    def checkout(self, *, amount: float, success_url: str, cancel_url: str) -> Checkout:
         """Create a Paddle checkout to buy credits. **Not retried, ever.**
 
         Money: no charge happens here, but this mints a live payment link and the
@@ -452,10 +453,10 @@ class Billing(SyncResource):
         Rate limited to 5/min on top of the global bucket.
         """
         spec, body = build_checkout(amount=amount, success_url=success_url, cancel_url=cancel_url)
-        data: Dict[str, Any] = self._json(spec, json=body)
+        data: Checkout = self._json(spec, json=body)
         return data
 
-    def transactions(self, *, limit: int = 50, offset: int = 0) -> List[Dict[str, Any]]:
+    def transactions(self, *, limit: int = 50, offset: int = 0) -> List[Transaction]:
         """One page of transaction history, newest first. Free read.
 
         Returns a bare list — no envelope, no total, no ``has_more``. The only
@@ -467,10 +468,10 @@ class Billing(SyncResource):
         whole page. Narrowing the window is not possible here — there is no date
         filter — so a persistent 500 needs support, not a retry.
         """
-        rows: List[Dict[str, Any]] = self._json(build_transactions(limit=limit, offset=offset))
+        rows: List[Transaction] = self._json(build_transactions(limit=limit, offset=offset))
         return rows
 
-    def iter_transactions(self, *, limit: int = 50, offset: int = 0) -> Iterator[Dict[str, Any]]:
+    def iter_transactions(self, *, limit: int = 50, offset: int = 0) -> Iterator[Transaction]:
         """Iterate transactions across pages, stopping on the first short page.
 
         Free reads, but offset pagination over a ``created_at DESC`` list is
@@ -557,13 +558,13 @@ class AsyncBilling(AsyncResource):
         self.subscription = AsyncBillingSubscription(client)
         self._pricing_cache: Optional[Dict[str, Any]] = None
 
-    async def balance(self) -> Dict[str, Any]:
+    async def balance(self) -> Balance:
         """Current credit balance. Free read.
 
         Never 404s — a missing balance row returns all zeros, so "new user" and
         "zero balance" are indistinguishable.
         """
-        data: Dict[str, Any] = await self._json(build_balance())
+        data: Balance = await self._json(build_balance())
         return data
 
     async def pricing(self, *, refresh: bool = False) -> Dict[str, Any]:
@@ -584,30 +585,28 @@ class AsyncBilling(AsyncResource):
         """
         return payg_enabled(await self.pricing(refresh=refresh))
 
-    async def checkout(self, *, amount: float, success_url: str, cancel_url: str) -> Dict[str, Any]:
+    async def checkout(self, *, amount: float, success_url: str, cancel_url: str) -> Checkout:
         """Create a Paddle checkout to buy credits. **Not retried, ever.**
 
         See :meth:`Billing.checkout`. No idempotency key, 5/min tier, and the
         only route gated by ``SUBSCRIPTION_ONLY`` (410 ``payg_retired``).
         """
         spec, body = build_checkout(amount=amount, success_url=success_url, cancel_url=cancel_url)
-        data: Dict[str, Any] = await self._json(spec, json=body)
+        data: Checkout = await self._json(spec, json=body)
         return data
 
-    async def transactions(self, *, limit: int = 50, offset: int = 0) -> List[Dict[str, Any]]:
+    async def transactions(self, *, limit: int = 50, offset: int = 0) -> List[Transaction]:
         """One page of transaction history, newest first. Free read.
 
         Bare list, no total. A single NULL in ``description``/``type``/
         ``currency``/``status`` 500s the whole page server-side.
         """
-        rows: List[Dict[str, Any]] = await self._json(
-            build_transactions(limit=limit, offset=offset)
-        )
+        rows: List[Transaction] = await self._json(build_transactions(limit=limit, offset=offset))
         return rows
 
     async def iter_transactions(
         self, *, limit: int = 50, offset: int = 0
-    ) -> AsyncIterator[Dict[str, Any]]:
+    ) -> AsyncIterator[Transaction]:
         """Iterate transactions across pages, stopping on the first short page.
 
         See :meth:`Billing.iter_transactions` — offset pagination over a
