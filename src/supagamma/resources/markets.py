@@ -31,6 +31,7 @@ from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Dict, Iterator, List, Optional, Tuple, cast
 
 from .._client import SAFE_READ
+from ..types import Market, MarketEstimate
 from ._base import AsyncResource, Call, SyncResource, call
 
 __all__ = [
@@ -172,10 +173,16 @@ def build_list(
         raise ValueError(f"limit must be between 1 and {MAX_LIMIT}, got {limit}.")
     if not 0 <= offset <= MAX_OFFSET:
         raise ValueError(f"offset must be between 0 and {MAX_OFFSET}, got {offset}.")
-    if tag is not None and any(ch in tag for ch in ",{}"):
+    if tag is not None:
+        # Kept in the signature so old callers get this message instead of a
+        # TypeError. Sending it would be worse than failing: the server ignores
+        # unknown query parameters, so the call would "succeed" and return an
+        # UNFILTERED page that reads as the filtered one.
         raise ValueError(
-            f"tag must not contain ',', '{{' or '}}': {tag!r} would change the meaning of "
-            "the server-side filter, which interpolates the value unescaped."
+            "The `tag` filter was removed from GET /v1/markets on 2026-08-26: no "
+            "market carries tags (the field was always null), and the server now "
+            "ignores the parameter, so it would silently return an unfiltered list. "
+            "Filter with `search` or `category` instead."
         )
 
     params = _drop_none(
@@ -184,7 +191,6 @@ def build_list(
             "closed": closed,
             "resolved": resolved,
             "category": category,
-            "tag": tag,
             "has_data": has_data,
             "data_type": data_type,
             "search": search,
@@ -257,11 +263,11 @@ _LIST_DOC = """List markets.
     Args:
         active/closed/resolved: exact-match filters on the market's lifecycle
             flags. Unset means "don't filter".
-        category: exact match.
-        tag: matches markets whose ``tags`` array contains this value. Rejected
-            client-side if it contains ``,``, ``{`` or ``}`` — the server
-            interpolates it unescaped, so those characters change the filter's
-            meaning rather than matching literally.
+        category: exact match. Only a small fraction of markets carry one, so
+            most category filters return few or no rows.
+        tag: **removed.** The API dropped this filter on 2026-08-26 and now
+            ignores it, so passing it raises ``ValueError`` rather than silently
+            returning an unfiltered list. Use ``search`` or ``category``.
         has_data: ``True`` restricts to markets with trades or orderbook rows.
             ``False`` applies **no filter at all** — it is the documented opt-out
             from the implicit filter described below, not a "dataless only"
@@ -280,8 +286,8 @@ _LIST_DOC = """List markets.
         limit: 1..1000. Rows beyond ``limit`` are simply absent — a truncated
             page is indistinguishable from a complete one except by being
             exactly ``limit`` long.
-        offset: 0..1,000,000. Above the ceiling the server 422s; use ``search``,
-            ``category`` or ``tag`` to narrow instead of paging deeper.
+        offset: 0..1,000,000. Above the ceiling the server 422s; use ``search``
+            or ``category`` to narrow instead of paging deeper.
 
     Hidden filter: when ``sort_by`` is ``top``/``trades``/``orderbook`` and
     ``has_data``, ``data_type`` and ``search`` are all unset, the router injects
@@ -292,8 +298,8 @@ _LIST_DOC = """List markets.
 
     Raises:
         ValueError: for an out-of-range ``limit``/``offset``, an unknown
-            ``sort_by``/``data_type``, or an unescapable ``tag`` — all before any
-            request is sent.
+            ``sort_by``/``data_type``, or any ``tag`` — all before any request is
+            sent.
         ValidationError: 422, including the non-retryable "search too broad"
             variant.
         ServiceUnavailableError: 503 when the listing query times out. Ships
@@ -390,7 +396,7 @@ _AUTO_PAGINATE_DOC = """Iterate every market matching the filters, page by page.
     2. Reaching ``offset > MAX_OFFSET`` (1,000,000) stops iteration with an
        :class:`OffsetCapReachedWarning`, because the next request would 422.
        Rows past that depth exist but cannot be reached by offset — narrow the
-       query with ``search``/``category``/``tag`` or a ``sort_by`` that puts the
+       query with ``search``/``category`` or a ``sort_by`` that puts the
        rows you want first.
 
     Offset pagination is not stable: the underlying order is a live DESC sort, so
@@ -421,7 +427,7 @@ class Markets(SyncResource):
         sort_by: str = "top",
         limit: int = DEFAULT_LIMIT,
         offset: int = 0,
-    ) -> List[Dict[str, Any]]:
+    ) -> List[Market]:
         __doc__ = _LIST_DOC  # noqa: F841
         spec = build_list(
             active=active,
@@ -436,10 +442,10 @@ class Markets(SyncResource):
             limit=limit,
             offset=offset,
         )
-        return cast(List[Dict[str, Any]], self._json(spec))
+        return cast(List[Market], self._json(spec))
 
-    def get(self, market_id: str) -> Dict[str, Any]:
-        return cast(Dict[str, Any], self._json(build_get(market_id)))
+    def get(self, market_id: str) -> Market:
+        return cast(Market, self._json(build_get(market_id)))
 
     def stats(self, market_id: str) -> Dict[str, Any]:
         return cast(Dict[str, Any], self._json(build_stats(market_id)))
@@ -452,7 +458,7 @@ class Markets(SyncResource):
         timeframe: Optional[str] = None,
         start: Optional[datetime] = None,
         end: Optional[datetime] = None,
-    ) -> Dict[str, Any]:
+    ) -> MarketEstimate:
         spec, body = build_estimate(
             market_id,
             data_type=data_type,
@@ -460,7 +466,7 @@ class Markets(SyncResource):
             start=start,
             end=end,
         )
-        return cast(Dict[str, Any], self._json(spec, json=body))
+        return cast(MarketEstimate, self._json(spec, json=body))
 
     def auto_paginate(
         self,
@@ -476,7 +482,7 @@ class Markets(SyncResource):
         sort_by: str = "top",
         limit: int = DEFAULT_LIMIT,
         offset: int = 0,
-    ) -> Iterator[Dict[str, Any]]:
+    ) -> Iterator[Market]:
         while True:
             spec = build_list(
                 active=active,
@@ -491,7 +497,7 @@ class Markets(SyncResource):
                 limit=limit,
                 offset=offset,
             )
-            rows = cast(List[Dict[str, Any]], self._json(spec))
+            rows = cast(List[Market], self._json(spec))
             yield from rows
             if len(rows) < limit:
                 return
@@ -523,7 +529,7 @@ class AsyncMarkets(AsyncResource):
         sort_by: str = "top",
         limit: int = DEFAULT_LIMIT,
         offset: int = 0,
-    ) -> List[Dict[str, Any]]:
+    ) -> List[Market]:
         spec = build_list(
             active=active,
             closed=closed,
@@ -537,10 +543,10 @@ class AsyncMarkets(AsyncResource):
             limit=limit,
             offset=offset,
         )
-        return cast(List[Dict[str, Any]], await self._json(spec))
+        return cast(List[Market], await self._json(spec))
 
-    async def get(self, market_id: str) -> Dict[str, Any]:
-        return cast(Dict[str, Any], await self._json(build_get(market_id)))
+    async def get(self, market_id: str) -> Market:
+        return cast(Market, await self._json(build_get(market_id)))
 
     async def stats(self, market_id: str) -> Dict[str, Any]:
         return cast(Dict[str, Any], await self._json(build_stats(market_id)))
@@ -553,7 +559,7 @@ class AsyncMarkets(AsyncResource):
         timeframe: Optional[str] = None,
         start: Optional[datetime] = None,
         end: Optional[datetime] = None,
-    ) -> Dict[str, Any]:
+    ) -> MarketEstimate:
         spec, body = build_estimate(
             market_id,
             data_type=data_type,
@@ -561,7 +567,7 @@ class AsyncMarkets(AsyncResource):
             start=start,
             end=end,
         )
-        return cast(Dict[str, Any], await self._json(spec, json=body))
+        return cast(MarketEstimate, await self._json(spec, json=body))
 
     async def auto_paginate(
         self,
@@ -577,7 +583,7 @@ class AsyncMarkets(AsyncResource):
         sort_by: str = "top",
         limit: int = DEFAULT_LIMIT,
         offset: int = 0,
-    ) -> AsyncIterator[Dict[str, Any]]:
+    ) -> AsyncIterator[Market]:
         while True:
             spec = build_list(
                 active=active,
@@ -592,7 +598,7 @@ class AsyncMarkets(AsyncResource):
                 limit=limit,
                 offset=offset,
             )
-            rows = cast(List[Dict[str, Any]], await self._json(spec))
+            rows = cast(List[Market], await self._json(spec))
             for row in rows:
                 yield row
             if len(rows) < limit:

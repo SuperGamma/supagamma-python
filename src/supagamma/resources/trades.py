@@ -29,6 +29,7 @@ from datetime import datetime
 from typing import Any, AsyncIterator, Dict, Iterator, List, Optional
 
 from .._client import SAFE_READ
+from ..types import OHLCVBar, Trade
 from ._base import AsyncResource, Call, SyncResource, call
 
 __all__ = [
@@ -179,7 +180,7 @@ class Trades(SyncResource):
         side: Optional[str] = None,
         limit: int = 100,
         offset: int = 0,
-    ) -> List[Dict[str, Any]]:
+    ) -> List[Trade]:
         """One page of trades, newest first.
 
         A market that exists but has no CLOB tokens returns ``[]``, while an
@@ -202,7 +203,7 @@ class Trades(SyncResource):
 
     def auto_paginate(
         self, *, limit: int = 1000, max_rows: Optional[int] = None, **kwargs: Any
-    ) -> Iterator[Dict[str, Any]]:
+    ) -> Iterator[Trade]:
         """Walk pages until the server returns a short one.
 
         There is no total and no cursor, so a short page is the only
@@ -238,7 +239,7 @@ class Trades(SyncResource):
         start: Optional[datetime] = None,
         end: Optional[datetime] = None,
         limit: int = 500,
-    ) -> List[Dict[str, Any]]:
+    ) -> List[OHLCVBar]:
         """OHLCV bars, newest first.
 
         ``5m``/``15m``/``4h`` are not real aggregations and emit
@@ -280,7 +281,7 @@ class AsyncTrades(AsyncResource):
         side: Optional[str] = None,
         limit: int = 100,
         offset: int = 0,
-    ) -> List[Dict[str, Any]]:
+    ) -> List[Trade]:
         return _annotate(
             await self._json(
                 build_list(
@@ -297,7 +298,7 @@ class AsyncTrades(AsyncResource):
 
     async def auto_paginate(
         self, *, limit: int = 1000, max_rows: Optional[int] = None, **kwargs: Any
-    ) -> AsyncIterator[Dict[str, Any]]:
+    ) -> AsyncIterator[Trade]:
         offset = int(kwargs.pop("offset", 0))
         yielded = 0
         while True:
@@ -328,7 +329,7 @@ class AsyncTrades(AsyncResource):
         start: Optional[datetime] = None,
         end: Optional[datetime] = None,
         limit: int = 500,
-    ) -> List[Dict[str, Any]]:
+    ) -> List[OHLCVBar]:
         return _annotate(
             await self._json(
                 build_ohlcv(

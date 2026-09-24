@@ -21,9 +21,10 @@ strings, not normalised datetimes.
 
 from __future__ import annotations
 
-from typing import Any, AsyncIterator, Dict, Iterator, List, Optional
+from typing import AsyncIterator, Iterator, List, Optional
 
 from .._client import SAFE_READ
+from ..types import PublicMarket, PublicMarketSummary
 from ._base import AsyncResource, Call, SyncResource, call
 
 __all__ = [
@@ -55,7 +56,7 @@ class PublicMarkets(SyncResource):
 
     def list(
         self, *, limit: int = 500, offset: int = 0, resolved: Optional[bool] = None
-    ) -> List[Dict[str, Any]]:
+    ) -> List[PublicMarketSummary]:
         """One page, ordered by volume descending (not configurable).
 
         Only markets with data are eligible — the server always applies
@@ -67,7 +68,7 @@ class PublicMarkets(SyncResource):
 
     def auto_paginate(
         self, *, limit: int = 500, resolved: Optional[bool] = None
-    ) -> Iterator[Dict[str, Any]]:
+    ) -> Iterator[PublicMarketSummary]:
         """Walk pages until one comes back **empty**.
 
         Deliberately not the short-page rule used elsewhere: this endpoint
@@ -82,7 +83,7 @@ class PublicMarkets(SyncResource):
             yield from rows
             offset += limit
 
-    def get(self, market_id: str) -> Dict[str, Any]:
+    def get(self, market_id: str) -> PublicMarket:
         """One market's metadata.
 
         A 404 here is ambiguous by design: it means the id is unknown, *or* the
@@ -98,12 +99,12 @@ class AsyncPublicMarkets(AsyncResource):
 
     async def list(
         self, *, limit: int = 500, offset: int = 0, resolved: Optional[bool] = None
-    ) -> List[Dict[str, Any]]:
+    ) -> List[PublicMarketSummary]:
         return await self._json(build_list(limit=limit, offset=offset, resolved=resolved))
 
     async def auto_paginate(
         self, *, limit: int = 500, resolved: Optional[bool] = None
-    ) -> AsyncIterator[Dict[str, Any]]:
+    ) -> AsyncIterator[PublicMarketSummary]:
         offset = 0
         while True:
             rows = await self.list(limit=limit, offset=offset, resolved=resolved)
@@ -113,7 +114,7 @@ class AsyncPublicMarkets(AsyncResource):
                 yield row
             offset += limit
 
-    async def get(self, market_id: str) -> Dict[str, Any]:
+    async def get(self, market_id: str) -> PublicMarket:
         return await self._json(build_get(market_id))
 
 

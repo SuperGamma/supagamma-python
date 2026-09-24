@@ -42,6 +42,27 @@ Create one in your [dashboard](https://supagamma.com/dashboard/api-keys). Keys l
 | `client.system` | `/health`, platform stats |
 | `client.public_markets` | Public market metadata (usually disabled) |
 
+## Typed responses
+
+Every response is still the plain dict the server sent. Where the API publishes a
+response schema, the SDK also declares its shape as a `TypedDict` in
+`supagamma.types`, so your editor and type checker know every field:
+
+```python
+from supagamma.types import Market
+
+market: Market = client.markets.get("1254468")
+market["trade_count"]      # int: the data you can buy
+market["volume"]           # Optional[float]: None when zero OR unknown
+```
+
+Two rules hold for every model. A declared key is always present (a missing
+value is `None`, never an absent key), and timestamps are ISO-8601 strings, as
+sent. The models are pinned to a snapshot of the API's published OpenAPI spec,
+so a server-side change fails this SDK's CI instead of drifting. Routes the API
+publishes no schema for, such as `markets.stats()` and the subscription
+endpoints, still return `Dict[str, Any]`.
+
 ## Backtesting
 
 `supagamma.backtest` is a dependency-free harness for scoring prediction-market
@@ -170,6 +191,22 @@ SupaGamma(
 ```
 
 Pass `api_key` **or** `jwt`, never both — sending both makes the server silently use the key and ignore the JWT, so the SDK refuses it up front.
+
+## Changes
+
+**0.2.0** (not yet on PyPI)
+
+- `supagamma.backtest`: the prediction-market backtesting harness.
+- Typed responses in `supagamma.types`, plus a `py.typed` marker so type
+  checkers actually read the SDK's annotations. 0.1.0 advertised
+  `Typing :: Typed` without the marker, so mypy and pyright ignored its types
+  entirely.
+- `client.markets`, `client.trades` and the other namespaces are now visible to
+  type checkers. They are attached at runtime, and every call on them used to
+  resolve as `Any`.
+- `markets.list(tag=...)` now raises `ValueError`. The API removed the tag
+  filter on 2026-08-26 and ignores the parameter, so the call had been silently
+  returning an unfiltered list.
 
 ## Requirements
 

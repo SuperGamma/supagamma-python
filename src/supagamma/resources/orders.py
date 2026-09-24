@@ -25,6 +25,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence
 
 from .._client import NEVER, SAFE_READ
+from ..types import Order
 from ._base import AsyncResource, Call, SyncResource, call
 
 __all__ = [
@@ -108,9 +109,7 @@ def estimate_cost_usd(record_count: int, data_type: str, pricing: Dict[str, Any]
 class Orders(SyncResource):
     """Cart checkout and its pricing constants."""
 
-    def create(
-        self, items: Sequence[OrderItem], *, idempotency_key: Optional[str] = None
-    ) -> Dict[str, Any]:
+    def create(self, items: Sequence[OrderItem], *, idempotency_key: Optional[str] = None) -> Order:
         """Place an order. **Spends money. Never retried automatically.**
 
         A key is generated for you and echoed back as ``idempotency_key`` on the
@@ -134,7 +133,7 @@ class Orders(SyncResource):
             result.setdefault("idempotency_key", payload["idempotency_key"])
         return result
 
-    def list(self, *, limit: int = 20) -> List[Dict[str, Any]]:
+    def list(self, *, limit: int = 20) -> List[Order]:
         """Past cart checkouts.
 
         This is **not** download history: rows without an order id — which is
@@ -166,14 +165,14 @@ class AsyncOrders(AsyncResource):
 
     async def create(
         self, items: Sequence[OrderItem], *, idempotency_key: Optional[str] = None
-    ) -> Dict[str, Any]:
+    ) -> Order:
         payload = _create_payload(items, idempotency_key)
         result = await self._json(build_create(), json=payload)
         if isinstance(result, dict):
             result.setdefault("idempotency_key", payload["idempotency_key"])
         return result
 
-    async def list(self, *, limit: int = 20) -> List[Dict[str, Any]]:
+    async def list(self, *, limit: int = 20) -> List[Order]:
         return await self._json(build_list(limit=limit))
 
     async def pricing(self) -> Dict[str, Any]:

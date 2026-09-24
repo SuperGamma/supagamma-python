@@ -16,6 +16,7 @@ from typing import List, Sequence, Tuple
 # Return / risk metrics over a series of per-bet returns or an equity curve.
 # --------------------------------------------------------------------------- #
 
+
 def total_return(equity_curve: Sequence[float]) -> float:
     """End-to-start return of an equity curve. ``[100, 110] -> 0.10``."""
     if len(equity_curve) < 2 or equity_curve[0] == 0:
@@ -59,13 +60,14 @@ def hit_rate(wins: int, total: int) -> float:
 # Calibration — the flagship. Are the market's prices honest probabilities?
 # --------------------------------------------------------------------------- #
 
+
 @dataclass(frozen=True)
 class CalibrationBin:
     lo: float
     hi: float
     n: int
-    predicted: float   # mean forecast probability in the bin
-    actual: float      # empirical outcome rate in the bin
+    predicted: float  # mean forecast probability in the bin
+    actual: float  # empirical outcome rate in the bin
 
     @property
     def edge(self) -> float:
@@ -128,7 +130,7 @@ def calibration(pairs: Sequence[Tuple[float, int]], n_bins: int = 10) -> Calibra
     width = 1.0 / n_bins
     buckets: List[List[Tuple[float, int]]] = [[] for _ in range(n_bins)]
     for p, o in clean:
-        idx = min(int(p / width), n_bins - 1)   # p == 1.0 lands in the last bin
+        idx = min(int(p / width), n_bins - 1)  # p == 1.0 lands in the last bin
         buckets[idx].append((p, o))
 
     bins: List[CalibrationBin] = []

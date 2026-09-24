@@ -29,6 +29,7 @@ from supagamma.backtest.data import realized_outcome, yes_probability
 
 # --- settle(): the money math ------------------------------------------------
 
+
 def test_winning_bet_pays_the_inverse_price():
     # $10 at price 0.25, win -> shares = 40, payout 40, pnl = 30
     assert settle(0.25, 10.0, won=True) == pytest.approx(30.0)
@@ -49,6 +50,7 @@ def test_fair_coin_is_symmetric():
 
 
 # --- the engine: side selection + settlement --------------------------------
+
 
 def _market(id_, prob, outcome):
     return ResolvedMarket(MarketView(id=id_, question="q?", prob=prob), outcome=outcome)
@@ -93,6 +95,7 @@ def test_strategy_cannot_see_the_outcome():
 
 # --- BetFavourite: only bets when confident, on the right side --------------
 
+
 def test_bet_favourite_backs_yes_when_yes_is_the_favourite():
     order = BetFavourite(min_confidence=0.6, stake=5)(MarketView("a", "q", prob=0.8))
     assert order == Order(YES, 5)
@@ -115,6 +118,7 @@ def test_fade_longshot_sells_the_low_tail():
 
 # --- metrics ----------------------------------------------------------------
 
+
 def test_total_return_and_drawdown():
     assert total_return([100, 150]) == pytest.approx(0.5)
     # peak 150 then 90 -> dd = 60/150 = 0.4
@@ -132,10 +136,11 @@ def test_sharpe_positive_for_a_good_series():
 
 # --- calibration: the flagship ----------------------------------------------
 
+
 def test_perfectly_calibrated_market_has_matching_bins():
     # forecast 0.1 -> 10% actually happen; forecast 0.9 -> 90% happen
-    pairs = [(0.1, 1)] + [(0.1, 0)] * 9        # 10% YES at forecast 0.1
-    pairs += [(0.9, 1)] * 9 + [(0.9, 0)]       # 90% YES at forecast 0.9
+    pairs = [(0.1, 1)] + [(0.1, 0)] * 9  # 10% YES at forecast 0.1
+    pairs += [(0.9, 1)] * 9 + [(0.9, 0)]  # 90% YES at forecast 0.9
     result = calibration(pairs, n_bins=10)
     low = result.bins[0]
     high = result.bins[-1]
@@ -149,7 +154,7 @@ def test_longshot_bias_shows_as_negative_edge_in_the_low_bin():
     # Longshots priced at 0.1 but only 3% actually happen -> over-priced tail.
     pairs = [(0.1, 1)] * 3 + [(0.1, 0)] * 97
     result = calibration(pairs, n_bins=10)
-    assert result.bins[0].edge < 0        # actual < predicted
+    assert result.bins[0].edge < 0  # actual < predicted
 
 
 def test_brier_bounds():
@@ -164,6 +169,7 @@ def test_calibration_p_equals_one_lands_in_last_bin():
 
 
 # --- record parsing ---------------------------------------------------------
+
 
 @pytest.mark.parametrize(
     "record, expected",

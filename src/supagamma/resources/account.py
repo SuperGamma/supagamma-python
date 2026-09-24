@@ -17,6 +17,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 
 from .._client import NEVER, SAFE_READ
+from ..types import ApiKey, DownloadRecord, NewApiKey, PrivacyEvent, Usage
 from ._base import AsyncResource, Call, SyncResource, call
 
 __all__ = [
@@ -92,13 +93,13 @@ def build_delete_cancel() -> Call:
 class Keys(SyncResource):
     """API key CRUD. Everything except :meth:`list` mutates and is never retried."""
 
-    def list(self) -> List[Dict[str, Any]]:
+    def list(self) -> List[ApiKey]:
         """Your keys. The plaintext value is never returned here — only at creation."""
         return self._json(build_list_keys())
 
     def create(
         self, *, name: Optional[str] = None, scopes: Optional[List[str]] = None
-    ) -> Dict[str, Any]:
+    ) -> NewApiKey:
         """Mint a key. **The plaintext is returned exactly once — store it now.**
 
         ``scopes`` may only narrow: a subset of the caller's own permissions.
@@ -116,11 +117,11 @@ class Keys(SyncResource):
         while the positive auth cache expires — don't assume immediate effect."""
         return self._json(build_revoke_key(key_id))
 
-    def rotate(self, key_id: str) -> Dict[str, Any]:
+    def rotate(self, key_id: str) -> NewApiKey:
         """Rotate a key, returning the new plaintext once. Never retried."""
         return self._json(build_rotate_key(key_id))
 
-    def provision(self) -> Dict[str, Any]:
+    def provision(self) -> NewApiKey:
         """Create or rotate the auto-provisioned key. **JWT auth only.**
 
         Revokes prior auto-provisioned keys and mints a fresh one, so this is
@@ -131,12 +132,12 @@ class Keys(SyncResource):
 
 
 class AsyncKeys(AsyncResource):
-    async def list(self) -> List[Dict[str, Any]]:
+    async def list(self) -> List[ApiKey]:
         return await self._json(build_list_keys())
 
     async def create(
         self, *, name: Optional[str] = None, scopes: Optional[List[str]] = None
-    ) -> Dict[str, Any]:
+    ) -> NewApiKey:
         body: Dict[str, Any] = {}
         if name is not None:
             body["name"] = name
@@ -147,10 +148,10 @@ class AsyncKeys(AsyncResource):
     async def revoke(self, key_id: str) -> Dict[str, Any]:
         return await self._json(build_revoke_key(key_id))
 
-    async def rotate(self, key_id: str) -> Dict[str, Any]:
+    async def rotate(self, key_id: str) -> NewApiKey:
         return await self._json(build_rotate_key(key_id))
 
-    async def provision(self) -> Dict[str, Any]:
+    async def provision(self) -> NewApiKey:
         return await self._json(build_provision())
 
 
@@ -165,11 +166,11 @@ class Account(SyncResource):
         """Who this credential is: user id, key name, rate limit, permissions."""
         return self._json(build_me())
 
-    def usage(self) -> Dict[str, Any]:
+    def usage(self) -> Usage:
         """Usage counters for the current period."""
         return self._json(build_usage())
 
-    def downloads(self, *, limit: int = 50, offset: int = 0) -> List[Dict[str, Any]]:
+    def downloads(self, *, limit: int = 50, offset: int = 0) -> List[DownloadRecord]:
         """Delivery history — the authoritative record of what you were charged.
 
         This is the endpoint to check after an ambiguous download or bulk
@@ -181,7 +182,7 @@ class Account(SyncResource):
         """Full GDPR export. Can be a large single body — expect a slow response."""
         return self._json(build_data_export())
 
-    def privacy_events(self) -> List[Dict[str, Any]]:
+    def privacy_events(self) -> List[PrivacyEvent]:
         return self._json(build_privacy_events())
 
     def request_deletion(self) -> Dict[str, Any]:
@@ -206,16 +207,16 @@ class AsyncAccount(AsyncResource):
     async def me(self) -> Dict[str, Any]:
         return await self._json(build_me())
 
-    async def usage(self) -> Dict[str, Any]:
+    async def usage(self) -> Usage:
         return await self._json(build_usage())
 
-    async def downloads(self, *, limit: int = 50, offset: int = 0) -> List[Dict[str, Any]]:
+    async def downloads(self, *, limit: int = 50, offset: int = 0) -> List[DownloadRecord]:
         return await self._json(build_downloads(limit=limit, offset=offset))
 
     async def data_export(self) -> Dict[str, Any]:
         return await self._json(build_data_export())
 
-    async def privacy_events(self) -> List[Dict[str, Any]]:
+    async def privacy_events(self) -> List[PrivacyEvent]:
         return await self._json(build_privacy_events())
 
     async def request_deletion(self) -> Dict[str, Any]:

@@ -21,6 +21,10 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from .._client import SAFE_READ
+
+# Aliased: this module's own sync resource class is also called `Series`.
+from ..types import Series as SeriesModel
+from ..types import SeriesEstimate
 from ._base import AsyncResource, Call, SyncResource, call
 
 __all__ = [
@@ -72,9 +76,9 @@ def build_estimate(
 class Series(SyncResource):
     """The catalogue of purchasable streams."""
 
-    _cache: Optional[List[Dict[str, Any]]] = None
+    _cache: Optional[List[SeriesModel]] = None
 
-    def list(self) -> List[Dict[str, Any]]:
+    def list(self) -> List[SeriesModel]:
         """The whole catalogue. Unpaginated and unfiltered by design.
 
         Served from a 600-second server-side cache behind a CDN, so a newly
@@ -82,7 +86,7 @@ class Series(SyncResource):
         """
         return self._json(build_list())
 
-    def get(self, series_id: str, *, cache: bool = False) -> Dict[str, Any]:
+    def get(self, series_id: str, *, cache: bool = False) -> SeriesModel:
         """One series.
 
         The server linear-scans the full catalogue for this, so prefer
@@ -108,7 +112,7 @@ class Series(SyncResource):
         timeframe: Optional[str] = None,
         start: Optional[datetime] = None,
         end: Optional[datetime] = None,
-    ) -> Dict[str, Any]:
+    ) -> SeriesEstimate:
         """Price a pull without buying it. Never charges.
 
         Caveats that change how you read the result:
@@ -134,12 +138,12 @@ class Series(SyncResource):
 class AsyncSeries(AsyncResource):
     """Async twin of :class:`Series`."""
 
-    _cache: Optional[List[Dict[str, Any]]] = None
+    _cache: Optional[List[SeriesModel]] = None
 
-    async def list(self) -> List[Dict[str, Any]]:
+    async def list(self) -> List[SeriesModel]:
         return await self._json(build_list())
 
-    async def get(self, series_id: str, *, cache: bool = False) -> Dict[str, Any]:
+    async def get(self, series_id: str, *, cache: bool = False) -> SeriesModel:
         if cache:
             if type(self)._cache is None:
                 type(self)._cache = await self.list()
@@ -156,7 +160,7 @@ class AsyncSeries(AsyncResource):
         timeframe: Optional[str] = None,
         start: Optional[datetime] = None,
         end: Optional[datetime] = None,
-    ) -> Dict[str, Any]:
+    ) -> SeriesEstimate:
         spec, body = build_estimate(
             series_id, data_type=data_type, timeframe=timeframe, start=start, end=end
         )
