@@ -7,11 +7,13 @@ header. Sending the header does nothing at all.
 Because of that, this SDK generates a ``uuid4`` key for every order you create
 and returns it on the result. If a ``create()`` call fails ambiguously (most
 importantly :class:`~supagamma.OrderStatusUnknownError`, a 502 meaning the order
-*may* have committed), re-issue it with the **same** key:
+*may* have committed) there is no result to read it from, so the same key is on
+the exception as ``exc.idempotency_key``. Re-issue the order with it:
 
-    order = client.orders.create(items)              # key generated for you
-    ...
-    client.orders.create(items, idempotency_key=order["idempotency_key"])
+    try:
+        order = client.orders.create(items)          # key generated for you
+    except (supagamma.APIConnectionError, supagamma.OrderStatusUnknownError) as exc:
+        order = client.orders.create(items, idempotency_key=exc.idempotency_key)
 
 The server namespaces the key per user and returns the original order on a
 repeat without charging again. Retrying *without* the key charges twice.
@@ -25,6 +27,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence
 
 from .._client import NEVER, SAFE_READ
+from .._errors import SupaGammaError
 from ..types import Order
 from ._base import AsyncResource, Call, SyncResource, call
 
@@ -113,8 +116,9 @@ class Orders(SyncResource):
         """Place an order. **Spends money. Never retried automatically.**
 
         A key is generated for you and echoed back as ``idempotency_key`` on the
-        result — keep it. On an ambiguous failure, re-issue with that same key;
-        the server returns the original order rather than charging again.
+        result. If the call fails instead, the same key is on the exception as
+        ``exc.idempotency_key``. On an ambiguous failure, re-issue with that same
+        key; the server returns the original order rather than charging again.
 
         Notes that surprise people:
 
@@ -128,7 +132,13 @@ class Orders(SyncResource):
           download re-counts.
         """
         payload = _create_payload(items, idempotency_key)
-        result = self._json(build_create(), json=payload)
+        try:
+            result = self._json(build_create(), json=payload)
+        except SupaGammaError as exc:
+            # A generated key would otherwise be lost with the failed call, and
+            # the replay it exists for needs it.
+            exc.idempotency_key = payload["idempotency_key"]
+            raise
         if isinstance(result, dict):
             result.setdefault("idempotency_key", payload["idempotency_key"])
         return result
@@ -167,7 +177,11 @@ class AsyncOrders(AsyncResource):
         self, items: Sequence[OrderItem], *, idempotency_key: Optional[str] = None
     ) -> Order:
         payload = _create_payload(items, idempotency_key)
-        result = await self._json(build_create(), json=payload)
+        try:
+            result = await self._json(build_create(), json=payload)
+        except SupaGammaError as exc:
+            exc.idempotency_key = payload["idempotency_key"]
+            raise
         if isinstance(result, dict):
             result.setdefault("idempotency_key", payload["idempotency_key"])
         return result

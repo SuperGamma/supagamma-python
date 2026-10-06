@@ -21,6 +21,7 @@ Refresh the snapshot when the API changes, then fix whatever this flags:
 
 from __future__ import annotations
 
+import inspect
 import json
 import re
 from datetime import datetime, timezone
@@ -34,6 +35,7 @@ from supagamma.resources import (
     account,
     billing,
     download,
+    exports,
     markets,
     orders,
     public_markets,
@@ -134,6 +136,9 @@ BUILDERS = [
         has_data=True,
         data_type="trades",
         search="election",
+        series_id="polymarket:btc-15m",
+        ending_after=START,
+        ending_before=END,
         sort_by="volume",
         limit=10,
         offset=0,
@@ -188,6 +193,10 @@ BUILDERS = [
     ),
     download.build_raw_datasets(),
     download.build_raw_estimate(data_type="polymarket_l2_deltas", start=START, end=END, limit=10),
+    exports.build_create(),
+    exports.build_list(limit=10),
+    exports.build_get("job-1"),
+    exports.build_url("job-1", ttl=300),
     system.build_root(),
     system.build_health(),
     system.build_stats(),
@@ -218,10 +227,89 @@ def test_every_query_parameter_is_one_the_route_declares(spec: Any) -> None:
     )
 
 
+# --- the export request body and the bounds the SDK enforces client-side ----------------
+
+
+def _export_body_schema() -> Dict[str, Any]:
+    return SCHEMAS["CreateExportRequest"]
+
+
+def test_the_export_body_sends_only_fields_the_api_declares():
+    """The body is JSON, so unlike a query string the parameter check above cannot see
+    it; a renamed or dropped field would be silently ignored by the server."""
+    payload = exports._create_payload(
+        kind="trades",
+        market_id="1254468",
+        series_id=None,
+        start=START,
+        end=END,
+        format="csv",
+        idempotency_key="k",
+    )
+    declared = set(_export_body_schema()["properties"])
+    assert set(payload) <= declared, sorted(set(payload) - declared)
+    raw = exports._create_payload(
+        kind="raw",
+        market_id=None,
+        series_id="polymarket:l2-delta-tape",
+        start=None,
+        end=None,
+        format="json",
+        idempotency_key=None,
+    )
+    assert set(raw) <= declared, sorted(set(raw) - declared)
+    assert set(_export_body_schema()["required"]) <= set(payload) & set(raw)
+
+
+def test_the_export_enums_match_the_api():
+    props = _export_body_schema()["properties"]
+    assert tuple(props["kind"]["enum"]) == exports.EXPORT_KINDS
+    assert tuple(props["format"]["enum"]) == exports.EXPORT_FORMATS
+    assert props["format"]["default"] == "parquet"
+
+
+def test_the_export_length_limit_matches_the_api():
+    props = _export_body_schema()["properties"]
+    (key_schema,) = [b for b in props["idempotency_key"]["anyOf"] if b.get("type") == "string"]
+    assert key_schema["maxLength"] == exports.MAX_IDEMPOTENCY_KEY_LENGTH
+
+
+def _query_schema(path: str, name: str) -> Dict[str, Any]:
+    (param,) = [
+        p
+        for p in SPEC["paths"][path]["get"]["parameters"]
+        if p["in"] == "query" and p["name"] == name
+    ]
+    return param["schema"]
+
+
+def test_the_export_list_and_url_bounds_match_the_api():
+    limit = _query_schema("/v1/exports", "limit")
+    assert (limit["minimum"], limit["maximum"]) == (1, exports.MAX_LIST_LIMIT)
+    ttl = _query_schema("/v1/exports/{job_id}/url", "ttl")
+    assert (ttl["minimum"], ttl["maximum"]) == (exports.URL_TTL_MIN, exports.URL_TTL_MAX)
+    # and the SDK's own defaults are the server's, so omitting an argument means the same
+    assert inspect.signature(exports.build_list).parameters["limit"].default == limit["default"]
+    assert inspect.signature(exports.build_url).parameters["ttl"].default == ttl["default"]
+
+
 def test_the_parameter_check_catches_a_stale_parameter():
     """Guard the guard: the exact drift this suite was written for must be caught."""
     stale = ("GET", "/v1/markets", {"tag": "elections", "limit": 10}, None)
     assert _undeclared_params(stale) == ["tag"]
+
+
+def test_the_sdk_knows_every_markets_sort_the_api_documents():
+    """The server never validates `sort_by` (a typo silently sorts by `top`), so the
+    SDK validates it against SORT_BY_VALUES, and that list must not fall behind:
+    `end_date` existed on the server for weeks while the SDK refused it. The only
+    published list of sorts is the parameter's description."""
+    (param,) = [
+        p for p in _spec_operation("GET", "/v1/markets")["parameters"] if p["name"] == "sort_by"
+    ]
+    described = param["description"].split("Sort:", 1)[1].split(".", 1)[0]
+    published = {word.split("(")[0].strip() for word in described.split(",")}
+    assert published == set(markets.SORT_BY_VALUES)
 
 
 def test_the_removed_tag_filter_fails_loudly_instead_of_returning_everything():

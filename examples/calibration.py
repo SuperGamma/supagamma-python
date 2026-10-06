@@ -15,7 +15,7 @@ Notes
 * By default this uses the free *metadata* price on each market record. On a
   resolved market that is often the settlement price, so treat the default run
   as a smoke test. For a real study, switch to the trade-tape VWAP (see below) --
-  that call reads the fills and **costs money**.
+  that reads the fills, and is **metered**: one paid trades download per market.
 * This is a research tool, not investment advice, and makes no performance
   promise. Fees, liquidity, and slippage make live results different.
 """
@@ -44,15 +44,16 @@ def main() -> int:
 
     client = SupaGamma(api_key=api_key)
 
-    # For a rigorous study, uncomment the price_fn to price each market at the
-    # trade-tape VWAP 24h before it resolved (this spends credits):
+    # For a rigorous study, price each market at the trade-tape VWAP 24h before it
+    # resolved. This is METERED: every market is one paid trades download, and
+    # MAX_MARKETS then bounds the number of paid requests (not the markets you get
+    # back; pass max_price_attempts to look past markets that are skipped). It
+    # needs pyarrow (pip install "supagamma[parquet]"). To opt in, uncomment:
     #   price_fn = vwap_price_fn(horizon_hours=24)
     price_fn = None
 
     print(f"Pulling up to {MAX_MARKETS} resolved markets with data...")
-    universe = list(
-        resolved_markets(client, max_markets=MAX_MARKETS, price_fn=price_fn)
-    )
+    universe = list(resolved_markets(client, max_markets=MAX_MARKETS, price_fn=price_fn))
     if not universe:
         print("No resolved markets came back. Widen the filters or check the key.")
         return 1

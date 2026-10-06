@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 from .account import Account, AsyncAccount
 from .billing import AsyncBilling, Billing
 from .download import AsyncDownload, Download
+from .exports import AsyncExports, Exports
 from .markets import AsyncMarkets, Markets
 from .orders import AsyncOrders, Orders
 from .public_markets import AsyncPublicMarkets, PublicMarkets
@@ -31,6 +32,7 @@ NAMESPACES = {
     "trades": (Trades, AsyncTrades),
     "series": (Series, AsyncSeries),
     "download": (Download, AsyncDownload),
+    "exports": (Exports, AsyncExports),
     "orders": (Orders, AsyncOrders),
     "billing": (Billing, AsyncBilling),
     "account": (Account, AsyncAccount),

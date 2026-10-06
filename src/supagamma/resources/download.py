@@ -1,8 +1,12 @@
 """``client.download`` — **the money path**.
 
 Every method on this namespace except :meth:`Download.raw_datasets` and
-:meth:`Download.raw_estimate` debits your credit balance. Read this before using
-it in anything automated.
+:meth:`Download.raw_estimate` is metered. On a pay-as-you-go deployment that debits
+your credit balance. On a subscription-only deployment
+(``client.billing.payg_enabled()`` is ``False``) an in-plan pull costs nothing per
+MB and counts toward the plan's monthly fair-use volume instead, and the ``$/MB``
+rates quoted below are metering references, not prices. Read this before using it
+in anything automated.
 
 **Nothing here is ever retried automatically.** Each route passes ``NEVER``,
 regardless of the client's ``max_retries``. The reason is specific: the server
@@ -14,6 +18,14 @@ re-derives ``end=now()`` looks like a *different* request to that matcher and is
 charged again at full price. If you retry a download, replay byte-identical
 parameters, and sleep a couple of seconds first — the entitlement row is written
 by a background task and may not exist the instant the response returns.
+
+**Large pulls: stream them, or use exports.** By default a download is read into
+memory (``result.content``). Pass ``save_to=`` and the body is written to a file as
+it arrives instead, so memory stays flat whatever the size, and the result is a
+:class:`DownloadedFile`. The write is all-or-nothing and never retried; see
+:mod:`supagamma._streaming`. For anything that could outrun the ~100 s a
+synchronous request has, use ``client.exports``, which builds the file in the
+background and hands back a re-usable link.
 
 **Truncation is silent.** When a pull hits its row cap the response carries no
 flag, no header and no marker; a truncated file looks exactly like a complete
@@ -29,17 +41,20 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import warnings
 import zipfile
 from dataclasses import dataclass, field
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Union
+from typing import Any, Dict, List, Optional, Sequence, Union, overload
 
 import httpx
 
 from .._client import NEVER, SAFE_READ
+from .._streaming import DownloadedFile, PathLike, safe_filename
+from .._streaming import filename_from as _filename_from
 from ._base import AsyncResource, Call, SyncResource, call
 
 logger = logging.getLogger("supagamma.download")
@@ -49,7 +64,9 @@ __all__ = [
     "NORMALIZABLE_DATA_TYPES",
     "BulkItem",
     "DownloadResult",
+    "DownloadedFile",
     "BulkResult",
+    "BulkFile",
     "CostWarning",
     "build_trades",
     "build_ohlcv",
@@ -114,11 +131,13 @@ class CostWarning(UserWarning):
 
 
 def estimate_cost_usd(rows: int, data_type: str) -> float:
-    """Local, approximate cost for ``rows`` of ``data_type``.
+    """Local, approximate metered cost for ``rows`` of ``data_type``.
 
     Mirrors the server's formula (there is no free-tier allowance), but the
     server re-counts on delivery, so treat this as an order-of-magnitude guide
-    for warnings — not as a quote.
+    for warnings — not as a quote. On a pay-as-you-go deployment it is dollars
+    off your balance; on a subscription it is a reference figure, because the pull
+    counts toward your plan's fair-use volume and is not billed per MB.
     """
     per_row = _BYTES_PER_ROW.get(data_type, 230)
     rate = _RATE_PER_MB.get(data_type, 1.00)
@@ -129,10 +148,12 @@ def _maybe_warn_cost(rows: int, data_type: str, confirm: Optional[Any] = None) -
     cost = estimate_cost_usd(rows, data_type)
     if cost < COST_WARN_THRESHOLD_USD:
         return
+    megabytes = rows * _BYTES_PER_ROW.get(data_type, 230) / 1_048_576
     message = (
-        f"This {data_type} pull requests up to {rows:,} rows, roughly ${cost:,.2f} at "
-        f"${_RATE_PER_MB.get(data_type, 1.0):.2f}/MB. Lower `limit` or narrow start/end "
-        f"if that is more than you intended."
+        f"This {data_type} pull requests up to {rows:,} rows, about {megabytes:,.0f} MB: "
+        f"roughly ${cost:,.2f} at the ${_RATE_PER_MB.get(data_type, 1.0):.2f}/MB metering "
+        f"rate (a subscription counts the MB toward its fair-use volume instead of "
+        f"billing it). Lower `limit` or narrow start/end if that is more than you intended."
     )
     if confirm is not None and not confirm(cost):
         raise RuntimeError(f"download cancelled by confirm_cost hook: {message}")
@@ -157,16 +178,6 @@ def build_trades(
     format: str = "parquet",
     limit: int = 100_000,
 ) -> Call:
-    if format == "json":
-        # The server serialises this route's Arrow timestamp column with a bare
-        # json.dumps() and no `default=`, so datetimes raise TypeError -> 500.
-        # It fires before the charge, so it costs nothing but a wasted call.
-        warnings.warn(
-            "format='json' on download.trades() is known to fail server-side "
-            "(the timestamp column is not JSON-serialisable). Use 'parquet' or 'csv'.",
-            UserWarning,
-            stacklevel=3,
-        )
     return call(
         "GET",
         "/v1/download/trades",
@@ -377,7 +388,7 @@ class DownloadResult:
         """Write to ``path``. If ``path`` is a directory, use the server's filename."""
         target = Path(path)
         if target.is_dir():
-            target = target / (self.filename or "supagamma-download")
+            target = target / safe_filename(self.filename)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(self.content)
         return target
@@ -388,6 +399,13 @@ class DownloadResult:
 
     def __len__(self) -> int:
         return len(self.content)
+
+
+def _manifest_of(archive: zipfile.ZipFile) -> Dict[str, Any]:
+    manifest: Dict[str, Any] = {}
+    if "manifest.json" in archive.namelist():
+        manifest = json.loads(archive.read("manifest.json"))
+    return manifest
 
 
 @dataclass
@@ -415,7 +433,7 @@ class BulkResult:
     def save_to(self, path: Union[str, Path]) -> Path:
         target = Path(path)
         if target.is_dir():
-            target = target / (self.filename or "supagamma_bulk.zip")
+            target = target / safe_filename(self.filename or "supagamma_bulk.zip")
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(self.content)
         return target
@@ -424,6 +442,41 @@ class BulkResult:
         out = Path(directory)
         out.mkdir(parents=True, exist_ok=True)
         with zipfile.ZipFile(BytesIO(self.content)) as archive:
+            archive.extractall(out)
+            return [out / name for name in archive.namelist()]
+
+
+@dataclass
+class BulkFile:
+    """A bulk ZIP streamed to disk, with its parsed manifest.
+
+    The file-backed twin of :class:`BulkResult`, returned by
+    ``bulk(items, save_to=...)``. The manifest is read from the saved archive, so
+    the bundle is never held in memory.
+    """
+
+    path: Path
+    size: int
+    manifest: Dict[str, Any] = field(default_factory=dict)
+    filename: Optional[str] = None
+    request_id: Optional[str] = None
+
+    @property
+    def total_cost(self) -> Optional[float]:
+        value = self.manifest.get("total_cost")
+        return float(value) if value is not None else None
+
+    @property
+    def items(self) -> List[Dict[str, Any]]:
+        return list(self.manifest.get("items") or [])
+
+    def __fspath__(self) -> str:
+        return os.fspath(self.path)
+
+    def extract_to(self, directory: Union[str, Path]) -> List[Path]:
+        out = Path(directory)
+        out.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(self.path) as archive:
             archive.extractall(out)
             return [out / name for name in archive.namelist()]
 
@@ -466,13 +519,6 @@ class BulkItem:
         return payload
 
 
-def _filename_from(response: httpx.Response) -> Optional[str]:
-    disposition = response.headers.get("content-disposition", "")
-    if "filename=" not in disposition:
-        return None
-    return disposition.split("filename=", 1)[1].strip().strip('"') or None
-
-
 def _to_result(response: httpx.Response) -> DownloadResult:
     return DownloadResult(
         content=response.content,
@@ -487,8 +533,7 @@ def _to_bulk_result(response: httpx.Response) -> BulkResult:
     manifest: Dict[str, Any] = {}
     try:
         with zipfile.ZipFile(BytesIO(content)) as archive:
-            if "manifest.json" in archive.namelist():
-                manifest = json.loads(archive.read("manifest.json"))
+            manifest = _manifest_of(archive)
     except (zipfile.BadZipFile, ValueError, KeyError):
         # Never let a manifest problem hide a bundle the caller already paid
         # for — hand back the bytes regardless.
@@ -501,22 +546,87 @@ def _to_bulk_result(response: httpx.Response) -> BulkResult:
     )
 
 
+def _to_bulk_file(saved: DownloadedFile) -> BulkFile:
+    manifest: Dict[str, Any] = {}
+    try:
+        with zipfile.ZipFile(saved.path) as archive:
+            manifest = _manifest_of(archive)
+    except (zipfile.BadZipFile, ValueError, KeyError, OSError):
+        # Same rule as _to_bulk_result: the bundle is on disk and paid for.
+        logger.warning("bulk response was not a readable zip; keeping the file as saved")
+    return BulkFile(
+        path=saved.path,
+        size=saved.size,
+        manifest=manifest,
+        filename=saved.filename,
+        request_id=saved.request_id,
+    )
+
+
 _MONEY_NOTE = """
-        **Spends credits.** Never retried automatically; see the module
-        docstring for why replaying a download needs byte-identical parameters.
+        **Metered** (fair-use volume on a subscription, credits on pay-as-you-go).
+        Never retried automatically; see the module docstring for why replaying a
+        download needs byte-identical parameters.
         Row-cap truncation is silent — call the matching estimate if
         completeness matters.
 """
 
+_SAVE_NOTE = """
+        ``save_to`` streams the body to a file instead of returning it in memory,
+        and returns a :class:`DownloadedFile`. Pass a file path, or an existing
+        directory to use the server's filename. The write is all-or-nothing (a
+        temp file is moved into place only once the body is complete, and a
+        short body raises), and it is never retried.
+"""
+
+
+def _bulk_payload(items: Sequence[BulkItem]) -> Dict[str, Any]:
+    if not items:
+        raise ValueError("bulk() needs at least one item")
+    if len(items) > 25:
+        raise ValueError(f"bulk() accepts at most 25 items, got {len(items)}")
+    return {"items": [item.to_payload() for item in items]}
+
 
 class Download(SyncResource):
-    """Paid data delivery. Every method here except the two estimates charges."""
+    """Metered data delivery. Every method here except the two estimates is metered."""
 
     #: Optional hook: ``confirm_cost(estimated_usd) -> bool``. Return False to
     #: abort before the request is sent.
     confirm_cost: Optional[Any] = None
 
     _datasets_cache: Optional[Any] = None
+
+    def _deliver(
+        self, spec: Call, save_to: Optional[PathLike], *, json: Any = None
+    ) -> Union[DownloadResult, DownloadedFile]:
+        if save_to is not None:
+            return self._save(spec, save_to, json=json)
+        return _to_result(self._raw(spec, json=json))
+
+    @overload
+    def trades(
+        self,
+        *,
+        market_id: str,
+        start: Optional[datetime] = None,
+        end: Optional[datetime] = None,
+        format: str = "parquet",
+        limit: int = 100_000,
+        save_to: None = None,
+    ) -> DownloadResult: ...
+
+    @overload
+    def trades(
+        self,
+        *,
+        market_id: str,
+        start: Optional[datetime] = None,
+        end: Optional[datetime] = None,
+        format: str = "parquet",
+        limit: int = 100_000,
+        save_to: PathLike,
+    ) -> DownloadedFile: ...
 
     def trades(
         self,
@@ -526,19 +636,52 @@ class Download(SyncResource):
         end: Optional[datetime] = None,
         format: str = "parquet",
         limit: int = 100_000,
-    ) -> DownloadResult:
+        save_to: Optional[PathLike] = None,
+    ) -> Union[DownloadResult, DownloadedFile]:
         """Per-market fills. $3.00/MB.
 
-        Defaults to parquet: this route's ``format='json'`` path is broken
-        server-side. Zero matching rows raises
+        **Both outcome tokens of the market arrive in ONE file**, told apart only
+        by the ``market_id`` column (the outcome token id). There is no
+        ``outcome`` column. The two tokens' prices are complementary (about ``p``
+        and ``1 - p``), so an average over the whole file lands near 0.5 whatever
+        the market thinks. Take ``outcome_token_ids`` from ``client.markets.get()``
+        (same order as ``outcomes``), then keep one token's rows or convert the
+        other's price to ``1 - price``.
+
+        Defaults to parquet. Zero matching rows raises
         :class:`~supagamma.NoDataInRangeError` rather than returning an empty file.
         """
         _maybe_warn_cost(limit, "trades", self.confirm_cost)
-        return _to_result(
-            self._raw(
-                build_trades(market_id=market_id, start=start, end=end, format=format, limit=limit)
-            )
+        return self._deliver(
+            build_trades(market_id=market_id, start=start, end=end, format=format, limit=limit),
+            save_to,
         )
+
+    @overload
+    def ohlcv(
+        self,
+        *,
+        market_id: str,
+        timeframe: str = "1h",
+        start: Optional[datetime] = None,
+        end: Optional[datetime] = None,
+        format: str = "csv",
+        limit: int = 1_000_000,
+        save_to: None = None,
+    ) -> DownloadResult: ...
+
+    @overload
+    def ohlcv(
+        self,
+        *,
+        market_id: str,
+        timeframe: str = "1h",
+        start: Optional[datetime] = None,
+        end: Optional[datetime] = None,
+        format: str = "csv",
+        limit: int = 1_000_000,
+        save_to: PathLike,
+    ) -> DownloadedFile: ...
 
     def ohlcv(
         self,
@@ -549,7 +692,8 @@ class Download(SyncResource):
         end: Optional[datetime] = None,
         format: str = "csv",
         limit: int = 1_000_000,
-    ) -> DownloadResult:
+        save_to: Optional[PathLike] = None,
+    ) -> Union[DownloadResult, DownloadedFile]:
         """OHLCV bars. $20.00/MB.
 
         The one per-market route with a free disposition: a non-subscriber
@@ -558,18 +702,41 @@ class Download(SyncResource):
         raises :class:`~supagamma.FreeTierCapError`. ``1m``/``1h`` are charged.
         """
         _maybe_warn_cost(limit, "ohlcv", self.confirm_cost)
-        return _to_result(
-            self._raw(
-                build_ohlcv(
-                    market_id=market_id,
-                    timeframe=timeframe,
-                    start=start,
-                    end=end,
-                    format=format,
-                    limit=limit,
-                )
-            )
+        return self._deliver(
+            build_ohlcv(
+                market_id=market_id,
+                timeframe=timeframe,
+                start=start,
+                end=end,
+                format=format,
+                limit=limit,
+            ),
+            save_to,
         )
+
+    @overload
+    def orderbook(
+        self,
+        *,
+        market_id: str,
+        start: Optional[datetime] = None,
+        end: Optional[datetime] = None,
+        format: str = "parquet",
+        limit: int = 100_000,
+        save_to: None = None,
+    ) -> DownloadResult: ...
+
+    @overload
+    def orderbook(
+        self,
+        *,
+        market_id: str,
+        start: Optional[datetime] = None,
+        end: Optional[datetime] = None,
+        format: str = "parquet",
+        limit: int = 100_000,
+        save_to: PathLike,
+    ) -> DownloadedFile: ...
 
     def orderbook(
         self,
@@ -579,7 +746,8 @@ class Download(SyncResource):
         end: Optional[datetime] = None,
         format: str = "parquet",
         limit: int = 100_000,
-    ) -> DownloadResult:
+        save_to: Optional[PathLike] = None,
+    ) -> Union[DownloadResult, DownloadedFile]:
         """Full-depth L2 snapshots. $5.00/MB — **the expensive one**.
 
         At ~2 KB per row the default ``limit`` is on the order of **$990**. This
@@ -591,13 +759,34 @@ class Download(SyncResource):
         or json.
         """
         _maybe_warn_cost(limit, "orderbook", self.confirm_cost)
-        return _to_result(
-            self._raw(
-                build_orderbook(
-                    market_id=market_id, start=start, end=end, format=format, limit=limit
-                )
-            )
+        return self._deliver(
+            build_orderbook(market_id=market_id, start=start, end=end, format=format, limit=limit),
+            save_to,
         )
+
+    @overload
+    def top_of_book(
+        self,
+        *,
+        market_id: str,
+        start: datetime,
+        end: datetime,
+        format: str = "csv",
+        limit: int = 100_000,
+        save_to: None = None,
+    ) -> DownloadResult: ...
+
+    @overload
+    def top_of_book(
+        self,
+        *,
+        market_id: str,
+        start: datetime,
+        end: datetime,
+        format: str = "csv",
+        limit: int = 100_000,
+        save_to: PathLike,
+    ) -> DownloadedFile: ...
 
     def top_of_book(
         self,
@@ -607,7 +796,8 @@ class Download(SyncResource):
         end: datetime,
         format: str = "csv",
         limit: int = 100_000,
-    ) -> DownloadResult:
+        save_to: Optional[PathLike] = None,
+    ) -> Union[DownloadResult, DownloadedFile]:
         """Best bid/ask projection. **Free — this route never charges.**
 
         ``start`` and ``end`` are required and the whole window must sit inside
@@ -615,13 +805,40 @@ class Download(SyncResource):
         :class:`~supagamma.FreeTierWindowError`. The monthly cap is measured on a
         fixed per-row estimate, so compressing with parquet buys no extra rows.
         """
-        return _to_result(
-            self._raw(
-                build_top_of_book(
-                    market_id=market_id, start=start, end=end, format=format, limit=limit
-                )
-            )
+        return self._deliver(
+            build_top_of_book(
+                market_id=market_id, start=start, end=end, format=format, limit=limit
+            ),
+            save_to,
         )
+
+    @overload
+    def options(
+        self,
+        *,
+        series_id: str,
+        data_type: str = "trades",
+        start: Optional[datetime] = None,
+        end: Optional[datetime] = None,
+        format: str = "csv",
+        instrument_prefix: Optional[str] = None,
+        limit: int = 500_000,
+        save_to: None = None,
+    ) -> DownloadResult: ...
+
+    @overload
+    def options(
+        self,
+        *,
+        series_id: str,
+        data_type: str = "trades",
+        start: Optional[datetime] = None,
+        end: Optional[datetime] = None,
+        format: str = "csv",
+        instrument_prefix: Optional[str] = None,
+        limit: int = 500_000,
+        save_to: PathLike,
+    ) -> DownloadedFile: ...
 
     def options(
         self,
@@ -633,26 +850,54 @@ class Download(SyncResource):
         format: str = "csv",
         instrument_prefix: Optional[str] = None,
         limit: int = 500_000,
-    ) -> DownloadResult:
+        save_to: Optional[PathLike] = None,
+    ) -> Union[DownloadResult, DownloadedFile]:
         """Crypto-derivatives archive. trades $3 / greeks $12 / snapshots $8 per MB.
 
         Crypto capture is paused as a business decision, so this serves the
         historical archive only.
         """
         _maybe_warn_cost(limit, data_type, self.confirm_cost)
-        return _to_result(
-            self._raw(
-                build_options(
-                    series_id=series_id,
-                    data_type=data_type,
-                    start=start,
-                    end=end,
-                    format=format,
-                    instrument_prefix=instrument_prefix,
-                    limit=limit,
-                )
-            )
+        return self._deliver(
+            build_options(
+                series_id=series_id,
+                data_type=data_type,
+                start=start,
+                end=end,
+                format=format,
+                instrument_prefix=instrument_prefix,
+                limit=limit,
+            ),
+            save_to,
         )
+
+    @overload
+    def series(
+        self,
+        *,
+        series_id: str,
+        data_type: str = "trades",
+        start: Optional[datetime] = None,
+        end: Optional[datetime] = None,
+        format: str = "csv",
+        instrument_prefix: Optional[str] = None,
+        limit: int = 500_000,
+        save_to: None = None,
+    ) -> DownloadResult: ...
+
+    @overload
+    def series(
+        self,
+        *,
+        series_id: str,
+        data_type: str = "trades",
+        start: Optional[datetime] = None,
+        end: Optional[datetime] = None,
+        format: str = "csv",
+        instrument_prefix: Optional[str] = None,
+        limit: int = 500_000,
+        save_to: PathLike,
+    ) -> DownloadedFile: ...
 
     def series(
         self,
@@ -664,7 +909,8 @@ class Download(SyncResource):
         format: str = "csv",
         instrument_prefix: Optional[str] = None,
         limit: int = 500_000,
-    ) -> DownloadResult:
+        save_to: Optional[PathLike] = None,
+    ) -> Union[DownloadResult, DownloadedFile]:
         """Catalogue-backed series.
 
         ``data_type`` here is a **pricing tier** (``trades``/``snapshots``/``ohlcv``),
@@ -673,19 +919,44 @@ class Download(SyncResource):
         so prefer :meth:`for_series`, which decides from the catalogue.
         """
         _maybe_warn_cost(limit, data_type, self.confirm_cost)
-        return _to_result(
-            self._raw(
-                build_series(
-                    series_id=series_id,
-                    data_type=data_type,
-                    start=start,
-                    end=end,
-                    format=format,
-                    instrument_prefix=instrument_prefix,
-                    limit=limit,
-                )
-            )
+        return self._deliver(
+            build_series(
+                series_id=series_id,
+                data_type=data_type,
+                start=start,
+                end=end,
+                format=format,
+                instrument_prefix=instrument_prefix,
+                limit=limit,
+            ),
+            save_to,
         )
+
+    @overload
+    def raw(
+        self,
+        data_type: str,
+        start: datetime,
+        end: datetime,
+        *,
+        format: str = "json",
+        shape: str = "raw",
+        limit: int = 500_000,
+        save_to: None = None,
+    ) -> DownloadResult: ...
+
+    @overload
+    def raw(
+        self,
+        data_type: str,
+        start: datetime,
+        end: datetime,
+        *,
+        format: str = "json",
+        shape: str = "raw",
+        limit: int = 500_000,
+        save_to: PathLike,
+    ) -> DownloadedFile: ...
 
     def raw(
         self,
@@ -696,7 +967,8 @@ class Download(SyncResource):
         format: str = "json",
         shape: str = "raw",
         limit: int = 500_000,
-    ) -> DownloadResult:
+        save_to: Optional[PathLike] = None,
+    ) -> Union[DownloadResult, DownloadedFile]:
         """The event-granular L2 tape.
 
         ``data_type``, ``start`` and ``end`` are positional and required — the
@@ -710,17 +982,16 @@ class Download(SyncResource):
         on real serialised bytes, so :meth:`raw_estimate` (which models the raw
         path) will understate it materially.
         """
-        return _to_result(
-            self._raw(
-                build_raw(
-                    data_type=data_type,
-                    start=start,
-                    end=end,
-                    format=format,
-                    shape=shape,
-                    limit=limit,
-                )
-            )
+        return self._deliver(
+            build_raw(
+                data_type=data_type,
+                start=start,
+                end=end,
+                format=format,
+                shape=shape,
+                limit=limit,
+            ),
+            save_to,
         )
 
     def raw_datasets(self, *, refresh: bool = False) -> Any:
@@ -755,7 +1026,15 @@ class Download(SyncResource):
             build_raw_estimate(data_type=data_type, start=start, end=end, limit=limit)
         )
 
-    def bulk(self, items: Sequence[BulkItem]) -> BulkResult:
+    @overload
+    def bulk(self, items: Sequence[BulkItem], *, save_to: None = None) -> BulkResult: ...
+
+    @overload
+    def bulk(self, items: Sequence[BulkItem], *, save_to: PathLike) -> BulkFile: ...
+
+    def bulk(
+        self, items: Sequence[BulkItem], *, save_to: Optional[PathLike] = None
+    ) -> Union[BulkResult, BulkFile]:
         """Up to 25 items, priced as a union, **one atomic debit**, one ZIP.
 
         There is **no idempotency mechanism on this route at all**, so it is
@@ -764,15 +1043,26 @@ class Download(SyncResource):
 
         A valid-but-empty item becomes an ``.EMPTY.txt`` entry with cost 0
         rather than failing; an *invalid* item fails the whole request.
+
+        With ``save_to`` the ZIP is streamed to disk and a :class:`BulkFile` is
+        returned; its manifest is read from the saved archive.
         """
-        if not items:
-            raise ValueError("bulk() needs at least one item")
-        if len(items) > 25:
-            raise ValueError(f"bulk() accepts at most 25 items, got {len(items)}")
-        payload = {"items": [item.to_payload() for item in items]}
+        payload = _bulk_payload(items)
+        if save_to is not None:
+            return _to_bulk_file(self._save(build_bulk(), save_to, json=payload))
         return _to_bulk_result(self._raw(build_bulk(), json=payload))
 
-    def for_series(self, series_id: str, **kwargs: Any) -> DownloadResult:
+    @overload
+    def for_series(
+        self, series_id: str, *, save_to: None = None, **kwargs: Any
+    ) -> DownloadResult: ...
+
+    @overload
+    def for_series(self, series_id: str, *, save_to: PathLike, **kwargs: Any) -> DownloadedFile: ...
+
+    def for_series(
+        self, series_id: str, *, save_to: Optional[PathLike] = None, **kwargs: Any
+    ) -> Union[DownloadResult, DownloadedFile]:
         """Route a series id to whichever download endpoint actually serves it.
 
         The split between :meth:`options` and :meth:`series` is determined by
@@ -790,7 +1080,11 @@ class Download(SyncResource):
         if asset_class in {"options", "crypto", "derivatives"} or series_id.startswith(
             ("deribit:", "lyra:", "aevo:", "delta:")
         ):
+            if save_to is not None:
+                return self.options(series_id=series_id, save_to=save_to, **kwargs)
             return self.options(series_id=series_id, **kwargs)
+        if save_to is not None:
+            return self.series(series_id=series_id, save_to=save_to, **kwargs)
         return self.series(series_id=series_id, **kwargs)
 
 
@@ -800,6 +1094,14 @@ class AsyncDownload(AsyncResource):
     confirm_cost: Optional[Any] = None
     _datasets_cache: Optional[Any] = None
 
+    async def _deliver(
+        self, spec: Call, save_to: Optional[PathLike], *, json: Any = None
+    ) -> Union[DownloadResult, DownloadedFile]:
+        if save_to is not None:
+            return await self._save(spec, save_to, json=json)
+        return _to_result(await self._raw(spec, json=json))
+
+    @overload
     async def trades(
         self,
         *,
@@ -808,13 +1110,62 @@ class AsyncDownload(AsyncResource):
         end: Optional[datetime] = None,
         format: str = "parquet",
         limit: int = 100_000,
-    ) -> DownloadResult:
+        save_to: None = None,
+    ) -> DownloadResult: ...
+
+    @overload
+    async def trades(
+        self,
+        *,
+        market_id: str,
+        start: Optional[datetime] = None,
+        end: Optional[datetime] = None,
+        format: str = "parquet",
+        limit: int = 100_000,
+        save_to: PathLike,
+    ) -> DownloadedFile: ...
+
+    async def trades(
+        self,
+        *,
+        market_id: str,
+        start: Optional[datetime] = None,
+        end: Optional[datetime] = None,
+        format: str = "parquet",
+        limit: int = 100_000,
+        save_to: Optional[PathLike] = None,
+    ) -> Union[DownloadResult, DownloadedFile]:
         _maybe_warn_cost(limit, "trades", self.confirm_cost)
-        return _to_result(
-            await self._raw(
-                build_trades(market_id=market_id, start=start, end=end, format=format, limit=limit)
-            )
+        return await self._deliver(
+            build_trades(market_id=market_id, start=start, end=end, format=format, limit=limit),
+            save_to,
         )
+
+    @overload
+    async def ohlcv(
+        self,
+        *,
+        market_id: str,
+        timeframe: str = "1h",
+        start: Optional[datetime] = None,
+        end: Optional[datetime] = None,
+        format: str = "csv",
+        limit: int = 1_000_000,
+        save_to: None = None,
+    ) -> DownloadResult: ...
+
+    @overload
+    async def ohlcv(
+        self,
+        *,
+        market_id: str,
+        timeframe: str = "1h",
+        start: Optional[datetime] = None,
+        end: Optional[datetime] = None,
+        format: str = "csv",
+        limit: int = 1_000_000,
+        save_to: PathLike,
+    ) -> DownloadedFile: ...
 
     async def ohlcv(
         self,
@@ -825,20 +1176,44 @@ class AsyncDownload(AsyncResource):
         end: Optional[datetime] = None,
         format: str = "csv",
         limit: int = 1_000_000,
-    ) -> DownloadResult:
+        save_to: Optional[PathLike] = None,
+    ) -> Union[DownloadResult, DownloadedFile]:
         _maybe_warn_cost(limit, "ohlcv", self.confirm_cost)
-        return _to_result(
-            await self._raw(
-                build_ohlcv(
-                    market_id=market_id,
-                    timeframe=timeframe,
-                    start=start,
-                    end=end,
-                    format=format,
-                    limit=limit,
-                )
-            )
+        return await self._deliver(
+            build_ohlcv(
+                market_id=market_id,
+                timeframe=timeframe,
+                start=start,
+                end=end,
+                format=format,
+                limit=limit,
+            ),
+            save_to,
         )
+
+    @overload
+    async def orderbook(
+        self,
+        *,
+        market_id: str,
+        start: Optional[datetime] = None,
+        end: Optional[datetime] = None,
+        format: str = "parquet",
+        limit: int = 100_000,
+        save_to: None = None,
+    ) -> DownloadResult: ...
+
+    @overload
+    async def orderbook(
+        self,
+        *,
+        market_id: str,
+        start: Optional[datetime] = None,
+        end: Optional[datetime] = None,
+        format: str = "parquet",
+        limit: int = 100_000,
+        save_to: PathLike,
+    ) -> DownloadedFile: ...
 
     async def orderbook(
         self,
@@ -848,15 +1223,37 @@ class AsyncDownload(AsyncResource):
         end: Optional[datetime] = None,
         format: str = "parquet",
         limit: int = 100_000,
-    ) -> DownloadResult:
+        save_to: Optional[PathLike] = None,
+    ) -> Union[DownloadResult, DownloadedFile]:
         _maybe_warn_cost(limit, "orderbook", self.confirm_cost)
-        return _to_result(
-            await self._raw(
-                build_orderbook(
-                    market_id=market_id, start=start, end=end, format=format, limit=limit
-                )
-            )
+        return await self._deliver(
+            build_orderbook(market_id=market_id, start=start, end=end, format=format, limit=limit),
+            save_to,
         )
+
+    @overload
+    async def top_of_book(
+        self,
+        *,
+        market_id: str,
+        start: datetime,
+        end: datetime,
+        format: str = "csv",
+        limit: int = 100_000,
+        save_to: None = None,
+    ) -> DownloadResult: ...
+
+    @overload
+    async def top_of_book(
+        self,
+        *,
+        market_id: str,
+        start: datetime,
+        end: datetime,
+        format: str = "csv",
+        limit: int = 100_000,
+        save_to: PathLike,
+    ) -> DownloadedFile: ...
 
     async def top_of_book(
         self,
@@ -866,14 +1263,42 @@ class AsyncDownload(AsyncResource):
         end: datetime,
         format: str = "csv",
         limit: int = 100_000,
-    ) -> DownloadResult:
-        return _to_result(
-            await self._raw(
-                build_top_of_book(
-                    market_id=market_id, start=start, end=end, format=format, limit=limit
-                )
-            )
+        save_to: Optional[PathLike] = None,
+    ) -> Union[DownloadResult, DownloadedFile]:
+        return await self._deliver(
+            build_top_of_book(
+                market_id=market_id, start=start, end=end, format=format, limit=limit
+            ),
+            save_to,
         )
+
+    @overload
+    async def options(
+        self,
+        *,
+        series_id: str,
+        data_type: str = "trades",
+        start: Optional[datetime] = None,
+        end: Optional[datetime] = None,
+        format: str = "csv",
+        instrument_prefix: Optional[str] = None,
+        limit: int = 500_000,
+        save_to: None = None,
+    ) -> DownloadResult: ...
+
+    @overload
+    async def options(
+        self,
+        *,
+        series_id: str,
+        data_type: str = "trades",
+        start: Optional[datetime] = None,
+        end: Optional[datetime] = None,
+        format: str = "csv",
+        instrument_prefix: Optional[str] = None,
+        limit: int = 500_000,
+        save_to: PathLike,
+    ) -> DownloadedFile: ...
 
     async def options(
         self,
@@ -885,21 +1310,49 @@ class AsyncDownload(AsyncResource):
         format: str = "csv",
         instrument_prefix: Optional[str] = None,
         limit: int = 500_000,
-    ) -> DownloadResult:
+        save_to: Optional[PathLike] = None,
+    ) -> Union[DownloadResult, DownloadedFile]:
         _maybe_warn_cost(limit, data_type, self.confirm_cost)
-        return _to_result(
-            await self._raw(
-                build_options(
-                    series_id=series_id,
-                    data_type=data_type,
-                    start=start,
-                    end=end,
-                    format=format,
-                    instrument_prefix=instrument_prefix,
-                    limit=limit,
-                )
-            )
+        return await self._deliver(
+            build_options(
+                series_id=series_id,
+                data_type=data_type,
+                start=start,
+                end=end,
+                format=format,
+                instrument_prefix=instrument_prefix,
+                limit=limit,
+            ),
+            save_to,
         )
+
+    @overload
+    async def series(
+        self,
+        *,
+        series_id: str,
+        data_type: str = "trades",
+        start: Optional[datetime] = None,
+        end: Optional[datetime] = None,
+        format: str = "csv",
+        instrument_prefix: Optional[str] = None,
+        limit: int = 500_000,
+        save_to: None = None,
+    ) -> DownloadResult: ...
+
+    @overload
+    async def series(
+        self,
+        *,
+        series_id: str,
+        data_type: str = "trades",
+        start: Optional[datetime] = None,
+        end: Optional[datetime] = None,
+        format: str = "csv",
+        instrument_prefix: Optional[str] = None,
+        limit: int = 500_000,
+        save_to: PathLike,
+    ) -> DownloadedFile: ...
 
     async def series(
         self,
@@ -911,21 +1364,47 @@ class AsyncDownload(AsyncResource):
         format: str = "csv",
         instrument_prefix: Optional[str] = None,
         limit: int = 500_000,
-    ) -> DownloadResult:
+        save_to: Optional[PathLike] = None,
+    ) -> Union[DownloadResult, DownloadedFile]:
         _maybe_warn_cost(limit, data_type, self.confirm_cost)
-        return _to_result(
-            await self._raw(
-                build_series(
-                    series_id=series_id,
-                    data_type=data_type,
-                    start=start,
-                    end=end,
-                    format=format,
-                    instrument_prefix=instrument_prefix,
-                    limit=limit,
-                )
-            )
+        return await self._deliver(
+            build_series(
+                series_id=series_id,
+                data_type=data_type,
+                start=start,
+                end=end,
+                format=format,
+                instrument_prefix=instrument_prefix,
+                limit=limit,
+            ),
+            save_to,
         )
+
+    @overload
+    async def raw(
+        self,
+        data_type: str,
+        start: datetime,
+        end: datetime,
+        *,
+        format: str = "json",
+        shape: str = "raw",
+        limit: int = 500_000,
+        save_to: None = None,
+    ) -> DownloadResult: ...
+
+    @overload
+    async def raw(
+        self,
+        data_type: str,
+        start: datetime,
+        end: datetime,
+        *,
+        format: str = "json",
+        shape: str = "raw",
+        limit: int = 500_000,
+        save_to: PathLike,
+    ) -> DownloadedFile: ...
 
     async def raw(
         self,
@@ -936,18 +1415,18 @@ class AsyncDownload(AsyncResource):
         format: str = "json",
         shape: str = "raw",
         limit: int = 500_000,
-    ) -> DownloadResult:
-        return _to_result(
-            await self._raw(
-                build_raw(
-                    data_type=data_type,
-                    start=start,
-                    end=end,
-                    format=format,
-                    shape=shape,
-                    limit=limit,
-                )
-            )
+        save_to: Optional[PathLike] = None,
+    ) -> Union[DownloadResult, DownloadedFile]:
+        return await self._deliver(
+            build_raw(
+                data_type=data_type,
+                start=start,
+                end=end,
+                format=format,
+                shape=shape,
+                limit=limit,
+            ),
+            save_to,
         )
 
     async def raw_datasets(self, *, refresh: bool = False) -> Any:
@@ -968,15 +1447,33 @@ class AsyncDownload(AsyncResource):
             build_raw_estimate(data_type=data_type, start=start, end=end, limit=limit)
         )
 
-    async def bulk(self, items: Sequence[BulkItem]) -> BulkResult:
-        if not items:
-            raise ValueError("bulk() needs at least one item")
-        if len(items) > 25:
-            raise ValueError(f"bulk() accepts at most 25 items, got {len(items)}")
-        payload = {"items": [item.to_payload() for item in items]}
+    @overload
+    async def bulk(self, items: Sequence[BulkItem], *, save_to: None = None) -> BulkResult: ...
+
+    @overload
+    async def bulk(self, items: Sequence[BulkItem], *, save_to: PathLike) -> BulkFile: ...
+
+    async def bulk(
+        self, items: Sequence[BulkItem], *, save_to: Optional[PathLike] = None
+    ) -> Union[BulkResult, BulkFile]:
+        payload = _bulk_payload(items)
+        if save_to is not None:
+            return _to_bulk_file(await self._save(build_bulk(), save_to, json=payload))
         return _to_bulk_result(await self._raw(build_bulk(), json=payload))
 
-    async def for_series(self, series_id: str, **kwargs: Any) -> DownloadResult:
+    @overload
+    async def for_series(
+        self, series_id: str, *, save_to: None = None, **kwargs: Any
+    ) -> DownloadResult: ...
+
+    @overload
+    async def for_series(
+        self, series_id: str, *, save_to: PathLike, **kwargs: Any
+    ) -> DownloadedFile: ...
+
+    async def for_series(
+        self, series_id: str, *, save_to: Optional[PathLike] = None, **kwargs: Any
+    ) -> Union[DownloadResult, DownloadedFile]:
         catalogue = await self._client.series.list()
         row = next(
             (r for r in catalogue if r.get("series_id") == series_id),
@@ -988,12 +1485,33 @@ class AsyncDownload(AsyncResource):
         if asset_class in {"options", "crypto", "derivatives"} or series_id.startswith(
             ("deribit:", "lyra:", "aevo:", "delta:")
         ):
+            if save_to is not None:
+                return await self.options(series_id=series_id, save_to=save_to, **kwargs)
             return await self.options(series_id=series_id, **kwargs)
+        if save_to is not None:
+            return await self.series(series_id=series_id, save_to=save_to, **kwargs)
         return await self.series(series_id=series_id, **kwargs)
 
 
+# Docstrings are written once, on the sync class, and shared so the two surfaces
+# cannot drift. The money note goes on every method that charges; the streaming
+# note on every method that can stream.
 for _name in ("trades", "ohlcv", "orderbook", "options", "series", "raw", "bulk"):
-    for _cls in (Download, AsyncDownload):
-        _method = getattr(_cls, _name, None)
-        if _method is not None and _method.__doc__:
-            _method.__doc__ += _MONEY_NOTE
+    Download.__dict__[_name].__doc__ += _MONEY_NOTE
+for _name in ("trades", "ohlcv", "orderbook", "top_of_book", "options", "series", "raw", "bulk"):
+    Download.__dict__[_name].__doc__ += _SAVE_NOTE
+for _name in (
+    "trades",
+    "ohlcv",
+    "orderbook",
+    "top_of_book",
+    "options",
+    "series",
+    "raw",
+    "raw_datasets",
+    "raw_estimate",
+    "bulk",
+    "for_series",
+):
+    AsyncDownload.__dict__[_name].__doc__ = Download.__dict__[_name].__doc__
+del _name

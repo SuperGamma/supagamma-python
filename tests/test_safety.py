@@ -22,7 +22,7 @@ from supagamma._errors import (
     RateLimitError,
     parse_error,
 )
-from supagamma.resources import NAMESPACES, account, download, orders
+from supagamma.resources import NAMESPACES, account, billing, download, exports, orders
 
 # --- the 429 split -----------------------------------------------------------
 
@@ -85,6 +85,11 @@ def test_order_creation_is_never_retried():
     assert orders.build_create()[3] is NEVER
 
 
+def test_export_creation_is_never_retried():
+    # Queues metered work. A replay is only safe BY HAND, with the same key.
+    assert exports.build_create()[3] is NEVER
+
+
 def test_key_provisioning_is_never_retried():
     # A retry loop here is a key storm that can invalidate a key another
     # in-flight request is using.
@@ -93,11 +98,76 @@ def test_key_provisioning_is_never_retried():
     assert account.build_revoke_key("k")[3] is NEVER
 
 
+def test_the_export_reads_are_retryable():
+    # Polling a job and minting its URL are free, and a poll loop that cannot
+    # survive one 503 is no use for a job that takes minutes.
+    for spec in (exports.build_list(), exports.build_get("j"), exports.build_url("j")):
+        assert spec[3] is not NEVER
+
+
 def test_the_free_estimates_are_retryable():
     # These do not charge, so they may be retried — but they still consume the
     # 10/hour download bucket, which is why they are cached at the call site.
     assert download.build_raw_datasets()[3] is not NEVER
     assert download.build_raw_estimate(data_type="polymarket_trades")[3] is not NEVER
+
+
+# --- the cost warning ---------------------------------------------------------------
+
+
+def test_the_cost_warning_gives_the_size_and_does_not_pretend_a_subscriber_pays_per_mb():
+    # 100,000 orderbook rows is ~198 MB. That is ~$990 of metering on a pay-as-you-go
+    # balance but only fair-use volume on a subscription, which is the production
+    # mode, so a bare "$990" would alarm people who will never be charged it.
+    with pytest.warns(download.CostWarning) as record:
+        download._maybe_warn_cost(100_000, "orderbook")
+    message = str(record[0].message)
+    assert "198 MB" in message and "$989.91" in message
+    assert "fair-use" in message and "metering" in message
+
+
+def test_a_small_pull_does_not_warn():
+    download._maybe_warn_cost(1_000, "trades")  # filterwarnings=error would raise
+
+
+def test_the_confirm_hook_can_veto_an_expensive_pull_before_it_is_sent():
+    seen = []
+
+    def refuse(usd: float) -> bool:
+        seen.append(usd)
+        return False
+
+    with pytest.raises(RuntimeError, match="cancelled by confirm_cost"):
+        download._maybe_warn_cost(100_000, "orderbook", refuse)
+    assert seen and 989 < seen[0] < 991
+
+
+# --- the plan a checkout may ask for ---------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "tier", ["researcher", "academic", "enterprise", "free", "", "Professional"]
+)
+def test_a_plan_the_api_no_longer_sells_is_rejected_before_any_request(tier):
+    # Researcher, Academic and Enterprise were retired server-side; the SDK kept
+    # offering "researcher" until it was told otherwise, so a checkout for it went
+    # out and came back 422.
+    with pytest.raises(ValueError, match="professional"):
+        billing.build_subscription_checkout(
+            tier=tier,
+            billing_period="monthly",
+            success_url="https://supagamma.com/ok",
+            cancel_url="https://supagamma.com/no",
+        )
+    with pytest.raises(ValueError, match="professional"):
+        billing.build_subscription_redeem(tier=tier, billing_period="annual")
+
+
+def test_the_one_self_serve_plan_is_accepted_for_both_periods():
+    assert billing.SELF_SERVE_TIERS == ("professional",)
+    for period in billing.BILLING_PERIODS:
+        _, body = billing.build_subscription_redeem(tier="professional", billing_period=period)
+        assert body == {"tier": "professional", "billing_period": period}
 
 
 # --- idempotency --------------------------------------------------------------
@@ -115,6 +185,36 @@ def test_a_supplied_idempotency_key_is_preserved_verbatim():
         [orders.OrderItem(data_type="trades", market_id="1")], "my-key"
     )
     assert payload["idempotency_key"] == "my-key"
+
+
+def _export_payload(**over):
+    spec = dict(
+        kind="trades",
+        market_id="1",
+        series_id=None,
+        start=None,
+        end=None,
+        format="parquet",
+        idempotency_key=None,
+    )
+    spec.update(over)
+    return exports._create_payload(**spec)
+
+
+def test_export_payload_always_carries_an_idempotency_key():
+    payload = _export_payload()
+    assert payload["idempotency_key"]
+    assert len(payload["idempotency_key"]) <= 128
+
+
+def test_each_export_without_a_supplied_key_gets_its_own():
+    # A constant default key would make every export after the first return the
+    # FIRST job (the server never compares the request), silently.
+    assert _export_payload()["idempotency_key"] != _export_payload()["idempotency_key"]
+
+
+def test_a_supplied_export_key_is_preserved_verbatim():
+    assert _export_payload(idempotency_key="my-key")["idempotency_key"] == "my-key"
 
 
 def test_an_order_item_without_an_identifier_is_rejected_before_sending():

@@ -30,6 +30,10 @@ from typing import Any, Dict, List, Mapping, Optional
 __all__ = [
     "SupaGammaError",
     "SupaGammaConfigError",
+    "MissingDependencyError",
+    "ResponseShapeError",
+    "ExportFailedError",
+    "ExportTimeoutError",
     "APIConnectionError",
     "APITimeoutError",
     "APIStatusError",
@@ -71,9 +75,62 @@ __all__ = [
 class SupaGammaError(Exception):
     """Base class for everything this SDK raises."""
 
+    #: Set on an error raised by a call that carried an idempotency key
+    #: (``orders.create``, ``exports.create``), so the caller can replay it with the
+    #: SAME key. Without this, a key the SDK generated would be lost on exactly the
+    #: failures (a timeout, a 502) where replaying is the question.
+    idempotency_key: Optional[str] = None
+
 
 class SupaGammaConfigError(SupaGammaError):
     """Client-side misuse, caught before any request leaves the process."""
+
+
+class MissingDependencyError(SupaGammaConfigError, ImportError):
+    """An optional dependency a feature needs is not installed.
+
+    Raised **before any request is made**, so a feature that cannot finish its
+    job never starts the paid part of it. It is an :class:`ImportError` as well,
+    so ``except ImportError`` catches it the way it would a failed ``import``.
+    """
+
+
+class ResponseShapeError(SupaGammaError):
+    """The server answered 2xx, but not with the shape this SDK documents.
+
+    Raised instead of returning a guess. For a paid download it means the file
+    was delivered and could not be read, so quote the ``request_id`` to support
+    rather than replaying the request.
+    """
+
+    def __init__(self, message: str, *, request_id: Optional[str] = None) -> None:
+        super().__init__(message)
+        self.request_id = request_id
+
+
+class ExportFailedError(SupaGammaError):
+    """An export reached a terminal state other than ``succeeded``.
+
+    ``job`` is the last job object the server returned; its ``status`` is
+    ``failed`` or ``expired``, and ``error`` carries the server's explanation
+    (which says whether you were charged).
+    """
+
+    def __init__(self, message: str, *, job: Optional[Dict[str, Any]] = None) -> None:
+        super().__init__(message)
+        self.job: Dict[str, Any] = dict(job or {})
+
+
+class ExportTimeoutError(SupaGammaError):
+    """``exports.wait`` gave up before the job finished.
+
+    The job itself is unaffected and keeps running: poll it again with
+    ``exports.get(job_id)``. ``job`` is the last state seen.
+    """
+
+    def __init__(self, message: str, *, job: Optional[Dict[str, Any]] = None) -> None:
+        super().__init__(message)
+        self.job: Dict[str, Any] = dict(job or {})
 
 
 class APIConnectionError(SupaGammaError):
@@ -332,8 +389,13 @@ class ServerError(APIStatusError):
 class OrderStatusUnknownError(ServerError):
     """502 from POST /v1/orders — the order MAY have been committed.
 
-    Retry only by replaying the same `idempotency_key`; retrying without one can
-    charge twice. Safest is to check `client.orders.list()` first.
+    Retry only by replaying the same `idempotency_key` (it is on this exception as
+    `.idempotency_key`); retrying without one can charge twice. Safest is to check
+    `client.orders.list()` first.
+
+    The parser raises this for ANY 502, so a 502 from `exports.create` arrives as
+    the same class, and means the same thing: the job may exist. Replay it with the
+    same key.
     """
 
 

@@ -2,24 +2,26 @@
 
 Nothing here spends credits; these are reads, and all of them are retryable.
 
-Four server behaviours are invisible in the response and are therefore repeated
+Three server behaviours are invisible in the response and are therefore repeated
 on the methods they affect:
 
 * **The ``market_id`` you send is not the ``market_id`` you get back.** You pass
   a ``markets.id`` (short, numeric). The server resolves it to CLOB outcome
   token ids, and the rows come back keyed by *token* id. Feeding a response
-  ``market_id`` back into a request 404s. The SDK exposes it as ``token_id`` on
-  each row while leaving the raw payload untouched.
+  ``market_id`` back into a request 404s on most routes (``trades.list`` and
+  ``ohlcv`` do accept a token id, to narrow a query to that one outcome). The SDK
+  exposes it as ``token_id`` on each row while leaving the raw payload untouched.
 * **``side`` is matched case-sensitively** against stored lowercase values, so
   ``side="BUY"`` passes the server's own regex and then silently returns ``[]``.
   This module lowercases it for you.
-* **Three of the six ``timeframe`` values are not real.** There is no resampling
-  layer: ``5m``/``15m`` are served from the 1-minute view and ``4h`` from the
-  1-hour view, with nothing in the payload saying so. Asking for one emits a
-  :class:`FakeTimeframeWarning`.
 * **``ohlcv`` has no ``offset``.** Bars come back newest-first and ``limit``
   truncates from the newest end, so older bars are reachable only by moving the
   ``start``/``end`` window — never by paging.
+
+Every ``timeframe`` is a real aggregation. ``5m``/``15m`` are folded from the
+1-minute archive and ``4h`` from 1-hour bars, on UTC boundaries. (The API did not
+aggregate them before 2026-09-29 and this SDK used to warn about it; that warning
+is gone.) ``1m``/``5m``/``15m`` are served at most 7 days per call.
 """
 
 from __future__ import annotations
@@ -46,11 +48,10 @@ __all__ = [
 #: Values the server accepts.
 TIMEFRAME_VALUES = ("1m", "5m", "15m", "1h", "4h", "1d")
 
-#: Values that correspond to an actual aggregation. The other three are aliases
-#: onto a finer view and return bars of a DIFFERENT width than requested.
-REAL_TIMEFRAMES = frozenset({"1m", "1h", "1d"})
-
-_FAKE_TIMEFRAME_TARGET = {"5m": "1m", "15m": "1m", "4h": "1h"}
+#: Timeframes whose bars are exactly as wide as requested. Since the API began
+#: aggregating 5m/15m/4h (2026-09-29) that is all six; the name is kept for
+#: code that imported it.
+REAL_TIMEFRAMES = frozenset(TIMEFRAME_VALUES)
 
 MAX_LIST_LIMIT = 10_000
 MAX_OFFSET = 1_000_000
@@ -58,11 +59,13 @@ MAX_RECENT_LIMIT = 100
 
 
 class FakeTimeframeWarning(UserWarning):
-    """The requested timeframe is served from a finer view without resampling.
+    """Deprecated: no longer emitted.
 
-    ``5m`` and ``15m`` return 1-minute bars; ``4h`` returns 1-hour bars. Nothing
-    in the response distinguishes them from a genuine aggregation, so anything
-    computed off bar width will be wrong unless you resample client-side.
+    Before 2026-09-29 the API served ``5m``/``15m`` from the 1-minute view and
+    ``4h`` from the 1-hour view without resampling, and this SDK warned about it.
+    The API now aggregates them, so there is nothing to warn about. The class
+    stays so ``warnings.filterwarnings("ignore", category=FakeTimeframeWarning)``
+    in existing code keeps working.
     """
 
 
@@ -118,14 +121,8 @@ def build_ohlcv(
     limit: int = 500,
     warn: bool = True,
 ) -> Call:
-    if warn and timeframe in _FAKE_TIMEFRAME_TARGET:
-        warnings.warn(
-            f"timeframe={timeframe!r} is not aggregated server-side; you will receive "
-            f"{_FAKE_TIMEFRAME_TARGET[timeframe]} bars. Resample client-side, or use one of "
-            f"{sorted(REAL_TIMEFRAMES)}.",
-            FakeTimeframeWarning,
-            stacklevel=3,
-        )
+    # `warn` is accepted and ignored: it controlled the FakeTimeframeWarning that is
+    # no longer emitted. Dropping the parameter would break callers that pass it.
     return call(
         "GET",
         "/v1/trades/ohlcv",
@@ -240,15 +237,18 @@ class Trades(SyncResource):
         end: Optional[datetime] = None,
         limit: int = 500,
     ) -> List[OHLCVBar]:
-        """OHLCV bars, newest first.
+        """OHLCV bars for one outcome, newest first.
 
-        ``5m``/``15m``/``4h`` are not real aggregations and emit
-        :class:`FakeTimeframeWarning`. There is no ``offset``: to reach older
-        bars, move ``start``/``end`` rather than paging.
+        Every ``timeframe`` is genuinely that wide: ``5m``/``15m`` are folded
+        from 1-minute bars and ``4h`` from 1-hour bars on UTC boundaries.
+        ``1m``/``5m``/``15m`` are served at most 7 days per call (a wider window
+        is a 400 that points at ``client.exports``); with no ``start``/``end``
+        the window ends when the market does. There is no ``offset``: to reach
+        older bars, move ``start``/``end`` rather than paging.
 
-        If the market has fewer outcome tokens than ``outcome + 1``, the server
-        silently queries *all* of the market's tokens and mixes outcomes into one
-        result set, with nothing in the payload indicating it.
+        ``outcome`` is the token's position in the market's outcomes (0 = the
+        first, e.g. Yes). A market with no such outcome raises
+        :class:`~supagamma.BadRequestError`; it is never widened to every token.
         """
         return _annotate(
             self._json(
