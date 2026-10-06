@@ -97,11 +97,12 @@ __all__ = [
     "payg_enabled",
 ]
 
-#: The only two tiers accepted as INPUT by ``subscription.checkout()`` and
-#: ``subscription.redeem()``. ``subscription.get()`` can still *report* ``free``,
-#: ``academic`` or ``enterprise`` — those are granted out of band (academic
-#: needs manual verification, enterprise is quote-only), never self-serve.
-SELF_SERVE_TIERS: Tuple[str, ...] = ("researcher", "professional")
+#: The only tier accepted as INPUT by ``subscription.checkout()`` and
+#: ``subscription.redeem()``. ``free`` is the default plan, not something you buy.
+#: ``researcher`` and ``enterprise`` were removed on 2026-08-19 and ``academic`` on
+#: 2026-08-25, so the server answers any of them with a 422; ``subscription.get()``
+#: may still *report* a retired name on an old row, which grants no entitlement.
+SELF_SERVE_TIERS: Tuple[str, ...] = ("professional",)
 
 BILLING_PERIODS: Tuple[str, ...] = ("monthly", "annual")
 
@@ -130,8 +131,8 @@ def _check_tier(tier: str) -> str:
     if tier not in SELF_SERVE_TIERS:
         raise ValueError(
             f"tier must be one of {SELF_SERVE_TIERS}, got {tier!r}. "
-            "'academic' and 'enterprise' exist but are not self-serve; the server "
-            "rejects them with a 422."
+            "'professional' is the only self-serve plan; 'researcher', 'academic' and "
+            "'enterprise' were retired and the server rejects them with a 422."
         )
     return tier
 
@@ -308,7 +309,7 @@ class BillingSubscription(SyncResource):
         links and a customer can pay both. Returns ``checkout_id`` (a Paddle
         ``txn_...``), ``checkout_url``, ``tier``, ``billing_period``.
 
-        ``tier`` must be ``"researcher"`` or ``"professional"`` and
+        ``tier`` must be ``"professional"`` (the only self-serve plan) and
         ``billing_period`` ``"monthly"`` or ``"annual"``; anything else raises
         ``ValueError`` here rather than 422-ing at the server.
 
@@ -335,10 +336,12 @@ class BillingSubscription(SyncResource):
         """Fund a subscription from the existing credit balance. **Not retried, ever.**
 
         Money: this DEBITS the credit balance immediately and atomically — the
-        full local price for the tier (researcher $79/mo, $499/yr; professional
-        $399/mo, $2499/yr) comes off the balance in the same transaction that
-        creates the subscription. Prices come from the API's own config, not
-        from Paddle. The period is a flat 30 or 365 days, not calendar-aligned.
+        full local price for the tier (professional: $399 monthly, $3,990 annual,
+        which is ten months) comes off the balance in the same transaction that
+        creates the subscription. The price is the API's own configured default,
+        not Paddle's catalog price, so the two can differ if the catalog changes
+        and the config does not. The period is a flat 30 or 365 days, not
+        calendar-aligned.
 
         Requires the ``download`` scope: this is the one billing route a
         narrowed ``["read"]`` API key cannot call (403). A JWT always qualifies.

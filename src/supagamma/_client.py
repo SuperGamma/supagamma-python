@@ -19,7 +19,17 @@ import re
 import time
 import uuid
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, Mapping, Optional, Tuple, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    AsyncIterator,
+    Dict,
+    Iterator,
+    Mapping,
+    Optional,
+    Tuple,
+    Union,
+)
 
 import httpx
 
@@ -37,6 +47,7 @@ if TYPE_CHECKING:  # pragma: no cover - annotations only; no runtime import cycl
     from .resources.account import Account, AsyncAccount
     from .resources.billing import AsyncBilling, Billing
     from .resources.download import AsyncDownload, Download
+    from .resources.exports import AsyncExports, Exports
     from .resources.markets import AsyncMarkets, Markets
     from .resources.orders import AsyncOrders, Orders
     from .resources.public_markets import AsyncPublicMarkets, PublicMarkets
@@ -274,6 +285,7 @@ class SupaGamma(BaseClient):
     trades: Trades
     series: Series
     download: Download
+    exports: Exports
     orders: Orders
     billing: Billing
     account: Account
@@ -306,6 +318,14 @@ class SupaGamma(BaseClient):
         policy: RetryPolicy = NEVER,
         stream: bool = False,
     ) -> httpx.Response:
+        """Send a request and return the response.
+
+        With ``stream=True`` the body is **not** read: the response comes back
+        open, and the caller must consume it and ``close()`` it (prefer
+        :meth:`stream`, which does the closing). Status handling and the retry
+        ``policy`` are identical either way, so a paid route that passes ``NEVER``
+        is never replayed just because its body is being streamed.
+        """
         attempts = self._effective_attempts(policy)
         url = self._url(path)
         query = self._clean_params(params)
@@ -314,9 +334,17 @@ class SupaGamma(BaseClient):
         for attempt in range(attempts + 1):
             request_headers = self._headers(extra=headers)
             try:
-                response = self._http.request(
-                    method, url, params=query, json=json, headers=request_headers
-                )
+                if stream:
+                    response = self._http.send(
+                        self._http.build_request(
+                            method, url, params=query, json=json, headers=request_headers
+                        ),
+                        stream=True,
+                    )
+                else:
+                    response = self._http.request(
+                        method, url, params=query, json=json, headers=request_headers
+                    )
             except httpx.TimeoutException as exc:
                 last_exc = APITimeoutError(str(exc), request_id=request_headers["X-Request-ID"])
                 if policy.on_connection_error and attempt < attempts:
@@ -334,6 +362,15 @@ class SupaGamma(BaseClient):
             if response.is_success:
                 return response
 
+            if stream:
+                # The caller never gets this response, so it is read and released
+                # here. An error body is small, and parse_error needs it.
+                try:
+                    with contextlib.suppress(httpx.HTTPError):
+                        response.read()
+                finally:
+                    response.close()
+
             try:
                 self._raise_for_status(response)
             except APIStatusError as exc:
@@ -345,6 +382,30 @@ class SupaGamma(BaseClient):
                 raise
 
         raise last_exc or APIConnectionError("request failed")  # pragma: no cover
+
+    @contextlib.contextmanager
+    def stream(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: Optional[Mapping[str, Any]] = None,
+        json: Any = None,
+        headers: Optional[Mapping[str, str]] = None,
+        policy: RetryPolicy = NEVER,
+    ) -> Iterator[httpx.Response]:
+        """Like :meth:`request`, but yields an open response and always closes it.
+
+        The status has already been checked (a non-2xx raised its typed error
+        before the ``with`` body ran), so the body can be consumed directly.
+        """
+        response = self.request(
+            method, path, params=params, json=json, headers=headers, policy=policy, stream=True
+        )
+        try:
+            yield response
+        finally:
+            response.close()
 
     def get_json(self, path: str, **kw: Any) -> Any:
         return self.request("GET", path, **kw).json()
@@ -376,6 +437,7 @@ class AsyncSupaGamma(BaseClient):
     trades: AsyncTrades
     series: AsyncSeries
     download: AsyncDownload
+    exports: AsyncExports
     orders: AsyncOrders
     billing: AsyncBilling
     account: AsyncAccount
@@ -408,6 +470,11 @@ class AsyncSupaGamma(BaseClient):
         policy: RetryPolicy = NEVER,
         stream: bool = False,
     ) -> httpx.Response:
+        """Async twin of :meth:`SupaGamma.request`.
+
+        With ``stream=True`` the response comes back open and unread; consume it
+        and ``await response.aclose()`` (prefer :meth:`stream`).
+        """
         import asyncio
 
         attempts = self._effective_attempts(policy)
@@ -418,9 +485,17 @@ class AsyncSupaGamma(BaseClient):
         for attempt in range(attempts + 1):
             request_headers = self._headers(extra=headers)
             try:
-                response = await self._http.request(
-                    method, url, params=query, json=json, headers=request_headers
-                )
+                if stream:
+                    response = await self._http.send(
+                        self._http.build_request(
+                            method, url, params=query, json=json, headers=request_headers
+                        ),
+                        stream=True,
+                    )
+                else:
+                    response = await self._http.request(
+                        method, url, params=query, json=json, headers=request_headers
+                    )
             except httpx.TimeoutException as exc:
                 last_exc = APITimeoutError(str(exc), request_id=request_headers["X-Request-ID"])
                 if policy.on_connection_error and attempt < attempts:
@@ -438,6 +513,14 @@ class AsyncSupaGamma(BaseClient):
             if response.is_success:
                 return response
 
+            if stream:
+                # See SupaGamma.request: read the small error body, release the socket.
+                try:
+                    with contextlib.suppress(httpx.HTTPError):
+                        await response.aread()
+                finally:
+                    await response.aclose()
+
             try:
                 self._raise_for_status(response)
             except APIStatusError as exc:
@@ -449,6 +532,26 @@ class AsyncSupaGamma(BaseClient):
                 raise
 
         raise last_exc or APIConnectionError("request failed")  # pragma: no cover
+
+    @contextlib.asynccontextmanager
+    async def stream(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: Optional[Mapping[str, Any]] = None,
+        json: Any = None,
+        headers: Optional[Mapping[str, str]] = None,
+        policy: RetryPolicy = NEVER,
+    ) -> AsyncIterator[httpx.Response]:
+        """Async twin of :meth:`SupaGamma.stream`."""
+        response = await self.request(
+            method, path, params=params, json=json, headers=headers, policy=policy, stream=True
+        )
+        try:
+            yield response
+        finally:
+            await response.aclose()
 
     async def get_json(self, path: str, **kw: Any) -> Any:
         return (await self.request("GET", path, **kw)).json()

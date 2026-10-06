@@ -8,8 +8,10 @@
 
 Three things about this API that the SDK surfaces rather than hides:
 
-* **Downloads spend money.** Every ``client.download.*`` call debits your
-  balance, so they are never retried automatically. See ``download``'s docstring.
+* **Downloads are metered.** Every ``client.download.*`` call counts toward your
+  plan's fair-use volume (or debits your balance, on a pay-as-you-go deployment),
+  so they are never retried automatically. See ``download``'s docstring. Anything
+  large should be an export (``client.exports``) or stream to disk (``save_to=``).
 * **429 means two different things.** ``RateLimitError`` is transient and
   retryable; ``QuotaExceededError`` is a billing cap and is not. They are
   separate exception classes for exactly that reason.
@@ -33,12 +35,15 @@ from ._errors import (  # noqa: E402
     BundleTooLargeError,
     ConflictError,
     EmptyLineItemError,
+    ExportFailedError,
+    ExportTimeoutError,
     FairUseCapError,
     FreeTierCapError,
     FreeTierWindowError,
     GoneError,
     InsufficientCreditsError,
     InvalidWindowError,
+    MissingDependencyError,
     MissingIdentifierError,
     NoDataInRangeError,
     NotFoundError,
@@ -51,6 +56,7 @@ from ._errors import (  # noqa: E402
     QuotaExceededError,
     RateLimitError,
     RawWindowRequiredError,
+    ResponseShapeError,
     SeriesComingSoonError,
     SeriesEmptyRangeError,
     ServerError,
@@ -69,6 +75,10 @@ __all__ = [
     "AsyncSupaGamma",
     "SupaGammaError",
     "SupaGammaConfigError",
+    "MissingDependencyError",
+    "ResponseShapeError",
+    "ExportFailedError",
+    "ExportTimeoutError",
     "APIConnectionError",
     "APITimeoutError",
     "APIStatusError",

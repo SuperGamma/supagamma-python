@@ -66,6 +66,12 @@ class Market(TypedDict):
 
     ``trade_count``/``orderbook_count`` and ``data_from``/``data_to`` describe the
     data SupaGamma holds for the market, i.e. what you can buy.
+
+    ``outcome_token_ids`` is parallel to ``outcomes`` and ``outcome_prices``
+    (index 0 is the first outcome, e.g. Yes). Trade rows and trade downloads name
+    an outcome only by this id in their ``market_id`` column, so it is how a
+    pulled fill is attributed to YES or NO. ``None`` when the market has no
+    tradable tokens.
     """
 
     id: str
@@ -74,6 +80,7 @@ class Market(TypedDict):
     description: Optional[str]
     outcomes: List[str]
     outcome_prices: Optional[List[float]]
+    outcome_token_ids: Optional[List[str]]
     active: bool
     closed: bool
     resolved: bool
@@ -92,10 +99,15 @@ class Market(TypedDict):
 
 
 class MarketEstimate(TypedDict):
-    """A cost preview from ``markets.estimate()``. It never charges.
+    """A size preview from ``markets.estimate()``. It never charges.
 
     ``in_range`` is ``False`` when the requested window holds no data for this
     market; ``estimated_rows`` is then ``0``.
+
+    On a subscription-only deployment ``estimated_cost_usd`` is a per-MB
+    *reference*, not a price: ``pricing_model``, ``included_in_plan``,
+    ``fair_use_share`` (the pull's share of one month's fair use) and
+    ``pricing_note`` say what the pull actually costs on your plan.
     """
 
     market_id: str
@@ -106,6 +118,10 @@ class MarketEstimate(TypedDict):
     rate_per_mb: float
     estimated_cost_usd: float
     in_range: bool
+    pricing_model: Optional[str]
+    included_in_plan: Optional[str]
+    fair_use_share: Optional[float]
+    pricing_note: Optional[str]
 
 
 class PublicMarketSummary(TypedDict):
@@ -146,7 +162,12 @@ class Trade(TypedDict):
 
     ``market_id`` here is the outcome TOKEN id, not ``markets.id``, which is why
     the SDK adds ``token_id`` (the same value, under an honest name). ``side`` is
-    ``"buy"`` or ``"sell"``; ``outcome`` is the outcome index.
+    the maker's side, ``"buy"`` or ``"sell"``. ``outcome`` is that token's position
+    in the market's outcomes and ``outcome_label`` names it (``"Yes"``, ``"Up"``);
+    both are ``None`` for a trade whose token could not be matched to a market
+    (the newest-trades feed, which is not market-scoped). ``size`` is the collateral
+    value of the fill, so shares = ``size / price``; ``collateral`` is ``"pUSD"``
+    from 2026-04-28 and ``"USDC"`` before.
     """
 
     id: str
@@ -156,7 +177,8 @@ class Trade(TypedDict):
     timestamp: str
     block_number: Optional[int]
     transaction_hash: Optional[str]
-    outcome: int
+    outcome: Optional[int]
+    outcome_label: Optional[str]
     side: str
     price: float
     size: float
@@ -164,6 +186,7 @@ class Trade(TypedDict):
     maker: Optional[str]
     taker: Optional[str]
     fee: Optional[float]
+    collateral: Optional[str]
 
 
 class OHLCVBar(TypedDict):
@@ -176,7 +199,7 @@ class OHLCVBar(TypedDict):
     market_id: str
     #: Added client-side by the SDK; equals ``market_id``. Not part of the API spec.
     token_id: str
-    outcome: int
+    outcome: Optional[int]
     timestamp: str
     open: float
     high: float
@@ -217,11 +240,15 @@ class Series(TypedDict):
 
 
 class SeriesEstimate(TypedDict):
-    """A cost preview from ``series.estimate()``. It never charges.
+    """A size preview from ``series.estimate()``. It never charges.
 
     When ``row_cap_applied`` is ``True`` the window holds more rows than one
-    download delivers; ``row_cap`` is that ceiling, and the estimate is priced at
+    download delivers; ``row_cap`` is that ceiling, and the estimate is sized at
     the cap, not the full window.
+
+    As on :class:`MarketEstimate`, ``estimated_cost_usd`` is a per-MB reference on
+    a subscription-only deployment, and ``pricing_note`` says what the pull means
+    on your plan.
     """
 
     series_id: str
@@ -235,6 +262,10 @@ class SeriesEstimate(TypedDict):
     coming_soon: bool
     row_cap_applied: bool
     row_cap: Optional[int]
+    pricing_model: Optional[str]
+    included_in_plan: Optional[str]
+    fair_use_share: Optional[float]
+    pricing_note: Optional[str]
 
 
 # --- orders --------------------------------------------------------------------------
@@ -280,6 +311,11 @@ class Balance(TypedDict):
 
     ``balance == lifetime_credits - lifetime_usage - lifetime_refunds`` always
     holds; the API's own reconciler checks it daily.
+
+    On a subscription-only deployment the balance is a legacy amount that can only
+    be redeemed toward a plan (``billing.subscription.redeem``). ``plan`` is the
+    caller's plan, and ``note`` explains the balance when that is not obvious;
+    both are ``None`` when there is nothing to add.
     """
 
     user_id: str
@@ -288,6 +324,8 @@ class Balance(TypedDict):
     lifetime_credits: float
     lifetime_usage: float
     lifetime_refunds: float
+    note: Optional[str]
+    plan: Optional[Dict[str, Any]]
 
 
 class Checkout(TypedDict):

@@ -17,6 +17,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, Dict, Mapping, Optional, Tuple
 
 from .._client import NEVER, RetryPolicy
+from .._streaming import DownloadedFile, PathLike, awrite_stream, filename_from, write_stream
 
 if TYPE_CHECKING:  # pragma: no cover
     from .._client import AsyncSupaGamma, SupaGamma
@@ -46,6 +47,16 @@ class SyncResource:
         method, path, params, policy = spec
         return self._client.request(method, path, params=params, json=json, policy=policy)
 
+    def _save(self, spec: Call, to: PathLike, *, json: Any = None) -> DownloadedFile:
+        """Stream a route's body to ``to`` instead of buffering it in memory.
+
+        The spec's retry policy applies exactly as it does to ``_raw``: a paid
+        route that declares ``NEVER`` is never replayed because it is streaming.
+        """
+        method, path, params, policy = spec
+        with self._client.stream(method, path, params=params, json=json, policy=policy) as response:
+            return write_stream(response, to, filename=filename_from(response))
+
 
 class AsyncResource:
     def __init__(self, client: AsyncSupaGamma) -> None:
@@ -59,3 +70,11 @@ class AsyncResource:
     async def _raw(self, spec: Call, *, json: Any = None) -> Any:
         method, path, params, policy = spec
         return await self._client.request(method, path, params=params, json=json, policy=policy)
+
+    async def _save(self, spec: Call, to: PathLike, *, json: Any = None) -> DownloadedFile:
+        """Async twin of :meth:`SyncResource._save`."""
+        method, path, params, policy = spec
+        async with self._client.stream(
+            method, path, params=params, json=json, policy=policy
+        ) as response:
+            return await awrite_stream(response, to, filename=filename_from(response))

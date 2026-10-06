@@ -43,8 +43,10 @@ classifiers = [
 dependencies = ["httpx>=0.27,<1"]
 
 [project.optional-dependencies]
-# Parquet downloads come back as bytes regardless; these are only needed if you
-# want the SDK to hand you a DataFrame.
+# Parquet downloads come back as bytes regardless. `parquet` is for code that has
+# the SDK read them (the backtest helper `vwap_price_fn` does, and says so with an
+# error that names this extra); `pandas` is for when you want a DataFrame.
+parquet = ["pyarrow>=15"]
 pandas = ["pandas>=2.0", "pyarrow>=15"]
 dev = [
     "pytest>=8",
@@ -109,8 +111,8 @@ warn_unreachable = true
 files = ["src/supagamma"]
 
 [[tool.mypy.overrides]]
-# pyarrow comes only with the optional `pandas` extra. CI type-checks without
-# it, and the code imports it defensively, so a missing module is expected
+# pyarrow comes only with the optional `parquet`/`pandas` extras. CI type-checks
+# without it, and the code imports it defensively, so a missing module is expected
 # rather than an error.
 module = ["pyarrow", "pyarrow.*"]
 ignore_missing_imports = true

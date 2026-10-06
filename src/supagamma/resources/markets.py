@@ -41,6 +41,7 @@ __all__ = [
     "DEFAULT_LIMIT",
     "MAX_LIMIT",
     "MAX_OFFSET",
+    "MAX_SERIES_ID_LENGTH",
     "OffsetCapReachedWarning",
     "build_list",
     "build_get",
@@ -60,6 +61,7 @@ SORT_BY_VALUES: Tuple[str, ...] = (
     "trades",
     "orderbook",
     "created",
+    "end_date",
 )
 
 #: Accepted ``data_type`` values for the list filter. Deliberately narrower than
@@ -75,6 +77,8 @@ MAX_LIMIT = 1000
 #: ``offset`` above this is a 422 from the server, so deep pagination past a
 #: million rows is impossible — narrow with filters instead.
 MAX_OFFSET = 1_000_000
+#: The server 422s a longer ``series_id``.
+MAX_SERIES_ID_LENGTH = 80
 
 
 class OffsetCapReachedWarning(UserWarning):
@@ -157,12 +161,15 @@ def build_list(
     has_data: Optional[bool] = None,
     data_type: Optional[str] = None,
     search: Optional[str] = None,
-    sort_by: str = "top",
+    series_id: Optional[str] = None,
+    ending_after: Optional[datetime] = None,
+    ending_before: Optional[datetime] = None,
+    sort_by: Optional[str] = None,
     limit: int = DEFAULT_LIMIT,
     offset: int = 0,
 ) -> Call:
     """Build ``GET /v1/markets``. Pure — no I/O."""
-    if sort_by not in SORT_BY_VALUES:
+    if sort_by is not None and sort_by not in SORT_BY_VALUES:
         raise ValueError(
             f"sort_by must be one of {SORT_BY_VALUES!r}, got {sort_by!r}. "
             "The server does not validate this and would silently sort by 'top'."
@@ -173,6 +180,20 @@ def build_list(
         raise ValueError(f"limit must be between 1 and {MAX_LIMIT}, got {limit}.")
     if not 0 <= offset <= MAX_OFFSET:
         raise ValueError(f"offset must be between 0 and {MAX_OFFSET}, got {offset}.")
+    if series_id is not None and not 1 <= len(series_id.strip()) <= MAX_SERIES_ID_LENGTH:
+        raise ValueError(
+            f"series_id must be a non-empty id of at most {MAX_SERIES_ID_LENGTH} characters, "
+            f"such as 'polymarket:btc-15m' (see client.series.list()), got {series_id!r}."
+        )
+    after = _to_utc(ending_after) if ending_after is not None else None
+    before = _to_utc(ending_before) if ending_before is not None else None
+    if after is not None and before is not None and after > before:
+        # The server would answer an inverted window with an empty 200, which
+        # reads exactly like "no market ends in this window".
+        raise ValueError(
+            f"ending_after must be on or before ending_before (got ending_after="
+            f"{after.isoformat()}, ending_before={before.isoformat()})."
+        )
     if tag is not None:
         # Kept in the signature so old callers get this message instead of a
         # TypeError. Sending it would be worse than failing: the server ignores
@@ -194,6 +215,12 @@ def build_list(
             "has_data": has_data,
             "data_type": data_type,
             "search": search,
+            "series_id": series_id,
+            "ending_after": after.isoformat() if after is not None else None,
+            "ending_before": before.isoformat() if before is not None else None,
+            # Unset is sent as nothing, so the server picks: `top`, or `end_date`
+            # with a series_id. Forcing `top` on a series would sort it by trade
+            # count instead of the end-date order its index serves.
             "sort_by": sort_by,
             "limit": limit,
             "offset": offset,
@@ -280,17 +307,31 @@ _LIST_DOC = """List markets.
             as wildcards. A term broad enough to time out the query comes back
             as a 422 (``"Search query too broad…"``) that is NOT retryable —
             narrow the term.
+        series_id: only markets in this series, such as ``"polymarket:btc-15m"``
+            (ids from ``client.series.list()``). An unknown id is a 404. Results
+            come newest-ending first unless ``sort_by`` says otherwise.
+        ending_after/ending_before: only markets whose ``end_date`` falls in
+            this window, both ends inclusive. Naive datetimes are read as UTC
+            and always sent with an offset. A window can hold far more markets
+            than ``offset`` paging can reach (a recent eight weeks is about a
+            million): page it with ``sort_by="end_date"``, moving
+            ``ending_before`` to the oldest ``end_date`` of the previous page and
+            dropping ids you already have, since markets often share an end time.
+            A window too large to list in time is a 422 that asks for exactly that.
         sort_by: one of ``SORT_BY_VALUES``. Every sort is DESC; there is no
-            ascending option. Validated client-side because the server silently
-            falls back to ``"top"`` on a typo and still returns 200.
+            ascending option. Unset (the default) lets the server choose:
+            ``"top"``, or ``"end_date"`` when ``series_id`` is set. Validated
+            client-side because the server silently falls back to ``"top"`` on a
+            typo and still returns 200.
         limit: 1..1000. Rows beyond ``limit`` are simply absent — a truncated
             page is indistinguishable from a complete one except by being
             exactly ``limit`` long.
         offset: 0..1,000,000. Above the ceiling the server 422s; use ``search``
             or ``category`` to narrow instead of paging deeper.
 
-    Hidden filter: when ``sort_by`` is ``top``/``trades``/``orderbook`` and
-    ``has_data``, ``data_type`` and ``search`` are all unset, the router injects
+    Hidden filter: when ``sort_by`` is ``top``/``trades``/``orderbook``/
+    ``newest_data`` (or unset, without ``series_id``) and ``has_data``,
+    ``data_type``, ``search`` and ``series_id`` are all unset, the router injects
     ``trade_count > 0 OR orderbook_count > 0``. The same injection happens on the
     ``search`` branch when ``data_type`` and ``has_data`` are both unset. So a
     bare ``list()`` never returns zero-data markets. Pass ``has_data=False`` to
@@ -298,10 +339,12 @@ _LIST_DOC = """List markets.
 
     Raises:
         ValueError: for an out-of-range ``limit``/``offset``, an unknown
-            ``sort_by``/``data_type``, or any ``tag`` — all before any request is
-            sent.
+            ``sort_by``/``data_type``, an empty or over-long ``series_id``, an
+            ``ending_after`` later than ``ending_before``, or any ``tag`` — all
+            before any request is sent.
+        NotFoundError: 404 for an unknown ``series_id``.
         ValidationError: 422, including the non-retryable "search too broad"
-            variant.
+            and "too many markets in this end-date window" variants.
         ServiceUnavailableError: 503 when the listing query times out. Ships
             ``Retry-After: 5`` and is retried automatically.
     """
@@ -312,9 +355,10 @@ _GET_DOC = """Fetch one market by id.
 
     ``market_id`` is ``markets.id`` — the short Polymarket numeric id such as
     ``"1254468"``. It is NOT a ``condition_id`` and NOT a CLOB token id, and the
-    token id you get back from ``client.trades`` responses will 404 here. No
-    endpoint in this API exposes ``condition_id``/``clob_token_ids``, so those
-    join keys have to come from elsewhere.
+    token id you get back from ``client.trades`` responses will 404 here. The
+    market's outcome token ids are on the object as ``outcome_token_ids``, in the
+    order of ``outcomes``, which is how a trade row (keyed by token) is matched to
+    its outcome; ``condition_id`` is not exposed.
 
     ``volume``, ``volume_24h`` and ``liquidity`` are ``null`` when the underlying
     value is zero OR unknown — the server cannot distinguish the two, so neither
@@ -424,7 +468,10 @@ class Markets(SyncResource):
         has_data: Optional[bool] = None,
         data_type: Optional[str] = None,
         search: Optional[str] = None,
-        sort_by: str = "top",
+        series_id: Optional[str] = None,
+        ending_after: Optional[datetime] = None,
+        ending_before: Optional[datetime] = None,
+        sort_by: Optional[str] = None,
         limit: int = DEFAULT_LIMIT,
         offset: int = 0,
     ) -> List[Market]:
@@ -438,6 +485,9 @@ class Markets(SyncResource):
             has_data=has_data,
             data_type=data_type,
             search=search,
+            series_id=series_id,
+            ending_after=ending_after,
+            ending_before=ending_before,
             sort_by=sort_by,
             limit=limit,
             offset=offset,
@@ -479,7 +529,10 @@ class Markets(SyncResource):
         has_data: Optional[bool] = None,
         data_type: Optional[str] = None,
         search: Optional[str] = None,
-        sort_by: str = "top",
+        series_id: Optional[str] = None,
+        ending_after: Optional[datetime] = None,
+        ending_before: Optional[datetime] = None,
+        sort_by: Optional[str] = None,
         limit: int = DEFAULT_LIMIT,
         offset: int = 0,
     ) -> Iterator[Market]:
@@ -493,6 +546,9 @@ class Markets(SyncResource):
                 has_data=has_data,
                 data_type=data_type,
                 search=search,
+                series_id=series_id,
+                ending_after=ending_after,
+                ending_before=ending_before,
                 sort_by=sort_by,
                 limit=limit,
                 offset=offset,
@@ -526,7 +582,10 @@ class AsyncMarkets(AsyncResource):
         has_data: Optional[bool] = None,
         data_type: Optional[str] = None,
         search: Optional[str] = None,
-        sort_by: str = "top",
+        series_id: Optional[str] = None,
+        ending_after: Optional[datetime] = None,
+        ending_before: Optional[datetime] = None,
+        sort_by: Optional[str] = None,
         limit: int = DEFAULT_LIMIT,
         offset: int = 0,
     ) -> List[Market]:
@@ -539,6 +598,9 @@ class AsyncMarkets(AsyncResource):
             has_data=has_data,
             data_type=data_type,
             search=search,
+            series_id=series_id,
+            ending_after=ending_after,
+            ending_before=ending_before,
             sort_by=sort_by,
             limit=limit,
             offset=offset,
@@ -580,7 +642,10 @@ class AsyncMarkets(AsyncResource):
         has_data: Optional[bool] = None,
         data_type: Optional[str] = None,
         search: Optional[str] = None,
-        sort_by: str = "top",
+        series_id: Optional[str] = None,
+        ending_after: Optional[datetime] = None,
+        ending_before: Optional[datetime] = None,
+        sort_by: Optional[str] = None,
         limit: int = DEFAULT_LIMIT,
         offset: int = 0,
     ) -> AsyncIterator[Market]:
@@ -594,6 +659,9 @@ class AsyncMarkets(AsyncResource):
                 has_data=has_data,
                 data_type=data_type,
                 search=search,
+                series_id=series_id,
+                ending_after=ending_after,
+                ending_before=ending_before,
                 sort_by=sort_by,
                 limit=limit,
                 offset=offset,
