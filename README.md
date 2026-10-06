@@ -266,7 +266,7 @@ Pass `api_key` **or** `jwt`, never both — sending both makes the server silent
 
 ## Changes
 
-**Unreleased**
+**0.3.0**
 
 - `client.exports`: the documented `/v1/exports` workflow, which the SDK had no
   way to call. `create` (never retried automatically, always carries an
