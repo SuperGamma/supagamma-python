@@ -11,7 +11,11 @@ concurrency:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # Pinned, not ubuntu-latest: ubuntu-latest moved to 26.04, and
+    # actions/python-versions publishes no CPython 3.9 build for 26.04 (3.9 is
+    # end-of-life). The package still declares requires-python >=3.9, so the 3.9
+    # leg stays and runs on 24.04, which has the 3.9.25 build.
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
