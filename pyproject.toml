@@ -71,6 +71,9 @@ packages = ["src/supagamma"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+# Explicit, so pytest-asyncio never warns that it is unset (that warning is an
+# error under filterwarnings). The only async fixture is function-scoped.
+asyncio_default_fixture_loop_scope = "function"
 filterwarnings = ["error"]
 
 [tool.ruff]
