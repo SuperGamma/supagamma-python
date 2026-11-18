@@ -40,6 +40,8 @@ from __future__ import annotations
 
 import json
 import math
+import re
+import warnings
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from typing import (
@@ -57,8 +59,9 @@ from typing import (
 
 from ._client import RetryPolicy
 from ._errors import MissingDependencyError, NoDataInRangeError, ResponseShapeError, SupaGammaError
+from .resources import download as _download
 from .resources._base import Call
-from .resources.download import _maybe_warn_cost, build_orderbook
+from .resources.download import CostWarning, build_orderbook, estimate_cost_usd
 from .resources.markets import _check_market_id
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -86,8 +89,10 @@ IntervalLike = Union[timedelta, int, float]
 DEFAULT_PAGE_SIZE = 2_500
 #: The server's own ceiling on ``limit``.
 MAX_PAGE_SIZE = 1_000_000
-#: How far back :meth:`Replay.at` looks first. The slowest capture tier is 15 min.
-DEFAULT_LOOKBACK = timedelta(hours=1)
+#: How far back :meth:`Replay.at` looks first; it doubles until a window answers.
+#: Short, because the whole window is downloaded: 5 min of the fastest (5 s) tier
+#: is ~120 rows for a binary market, and the 15 min tier answers on the third try.
+DEFAULT_LOOKBACK = timedelta(minutes=5)
 
 #: Replay's retry policy: the rate limiter only. A string-detail 429 is the
 #: limiter turning the request away before the route runs, so nothing was served
@@ -142,11 +147,16 @@ class BookState:
 # --- input validation (pure) --------------------------------------------------
 
 
+_FRACTION = re.compile(r"(?<=\d\d:\d\d:\d\d)\.(\d+)")
+
+
 def _parse_iso(text: str) -> Optional[datetime]:
     """``datetime.fromisoformat`` that also takes a trailing ``Z``; None if unreadable."""
     text = text.strip()
     if text[-1:] in ("Z", "z"):
         text = text[:-1] + "+00:00"
+    # Python < 3.11 accepts only 3 or 6 fractional digits; pad or trim to 6.
+    text = _FRACTION.sub(lambda m: "." + (m.group(1) + "000000")[:6], text, count=1)
     try:
         return datetime.fromisoformat(text)
     except ValueError:
@@ -178,21 +188,24 @@ def _parse_time(value: Any, name: str) -> datetime:
     return parsed.astimezone(_UTC)
 
 
-def _parse_interval(value: Optional[IntervalLike]) -> Optional[timedelta]:
+def _parse_interval(value: Optional[IntervalLike], name: str = "interval") -> Optional[timedelta]:
     if value is None:
         return None
     if isinstance(value, bool):
-        raise TypeError("interval must be a timedelta or a number of seconds.")
+        raise TypeError(f"{name} must be a timedelta or a number of seconds.")
     if isinstance(value, timedelta):
         step = value
     elif isinstance(value, (int, float)):
         if not math.isfinite(value):
-            raise ValueError("interval must be a finite number of seconds.")
-        step = timedelta(seconds=value)
+            raise ValueError(f"{name} must be a finite number of seconds.")
+        try:
+            step = timedelta(seconds=value)
+        except OverflowError:
+            raise ValueError(f"{name} is too large.") from None
     else:
-        raise TypeError("interval must be a timedelta or a number of seconds.")
+        raise TypeError(f"{name} must be a timedelta or a number of seconds.")
     if step <= timedelta(0):
-        raise ValueError("interval must be positive.")
+        raise ValueError(f"{name} must be positive.")
     return step
 
 
@@ -345,7 +358,10 @@ class _Pager:
 
         nxt = states[-1].timestamp
         if nxt <= self.cursor:
-            nxt = max(s.timestamp for s in states)
+            # The cut fell on a row at the cursor. Advance as little as possible:
+            # to the oldest timestamp past it, so nothing in between is skipped.
+            later = [s.timestamp for s in states if s.timestamp > self.cursor]
+            nxt = min(later) if later else self.cursor
         if nxt <= self.cursor:
             # A full page, all at the cursor: the next request would be identical.
             raise SupaGammaError(
@@ -428,21 +444,40 @@ class _ReplayBase:
         self.interval = _parse_interval(interval)
         self.page_size = _check_page_size(page_size)
 
-    def _before_page(self, download: Any) -> None:
-        """The cost check every download makes, run before EACH page.
+    def _before_page(self, download: Any, fetched: int, warned: bool) -> bool:
+        """The download cost check, run before EACH page, on the running total.
 
-        Reads ``client.download.confirm_cost`` at the time, so a hook set after
-        the replay was built still applies, and it sees every page, not just the
-        first. It prices one page (``page_size`` rows): the replay's total is
-        not known until the window has been walked.
+        Prices the rows fetched so far plus this page, so a long replay of
+        individually small pages still reaches the warning and the hook. Reads
+        ``client.download.confirm_cost`` each time, so a hook set after the
+        replay was built applies. Warns once per walk and asks the hook before
+        every page past the line. Returns whether it has warned.
         """
-        _maybe_warn_cost(self.page_size, "orderbook", getattr(download, "confirm_cost", None))
+        rows = fetched + self.page_size
+        cost = estimate_cost_usd(rows, "orderbook")
+        if cost < _download.COST_WARN_THRESHOLD_USD:
+            return warned
+        megabytes = rows * 2076 / 1_048_576
+        message = (
+            f"This replay reaches up to {rows:,} orderbook rows with its next page, "
+            f"about {megabytes:,.0f} MB: roughly ${cost:,.2f} at the $5.00/MB metering "
+            "rate (a subscription counts the MB toward its fair-use volume instead of "
+            "billing it). Narrow start/end if that is more than you intended."
+        )
+        hook = getattr(download, "confirm_cost", None)
+        if hook is not None and not hook(cost):
+            raise RuntimeError(f"replay cancelled by confirm_cost hook: {message}")
+        if not warned:
+            warnings.warn(message, CostWarning, stacklevel=4)
+        return True
 
     def _check_page(self, served: Set[str], matched: bool) -> None:
-        # Pages carry whole capture ticks, and a tick holds every outcome, so a
-        # page that served rows and matched none means the filter matches
-        # nothing. Stop now instead of downloading the rest of the window.
-        if served and not matched:
+        # Pages carry whole capture ticks, and a tick normally holds every
+        # outcome. So a page that served two or more outcomes and matched none
+        # means the filter matches nothing: stop now instead of downloading the
+        # rest of the window. With one outcome served it may be a capture gap
+        # for the wanted one, so keep going.
+        if len(served) >= 2 and not matched:
             raise self._no_match(served)
 
     def _wanted(self, state: BookState) -> bool:
@@ -475,7 +510,7 @@ class _ReplayBase:
 
     @staticmethod
     def _lookback(value: Any) -> timedelta:
-        step = _parse_interval(value)
+        step = _parse_interval(value, "lookback")
         if step is None:
             raise ValueError("lookback must be positive.")
         return step
@@ -558,9 +593,11 @@ class Replay(_ReplayBase):
         pager = _Pager(self.market_id, start, end, self.page_size)
         served: Set[str] = set()
         matched = False
+        fetched = 0
+        warned = False
         while not pager.done:
             method, path, params, policy = pager.call()
-            self._before_page(self._client.download)
+            warned = self._before_page(self._client.download, fetched, warned)
             try:
                 response = self._client.request(method, path, params=params, policy=policy)
             except NoDataInRangeError:
@@ -573,6 +610,7 @@ class Replay(_ReplayBase):
                     "GET /v1/download/orderbook did not return JSON",
                     request_id=response.headers.get("x-request-id"),
                 ) from None
+            fetched += len(body) if isinstance(body, list) else 0
             for state in pager.accept(body):
                 served.add(state.outcome or state.token_id)
                 if self._wanted(state):
@@ -610,7 +648,7 @@ class Replay(_ReplayBase):
         hi = self._target(when)
         span = self._lookback(lookback)
         while True:
-            lo = max(self.start, hi - span)
+            lo = self.start if span >= hi - self.start else hi - span
             latest: Dict[str, BookState] = {}
             for state in self._fetch(lo, hi):
                 latest[state.token_id] = state
@@ -676,9 +714,11 @@ class AsyncReplay(_ReplayBase):
         pager = _Pager(self.market_id, start, end, self.page_size)
         served: Set[str] = set()
         matched = False
+        fetched = 0
+        warned = False
         while not pager.done:
             method, path, params, policy = pager.call()
-            self._before_page(self._client.download)
+            warned = self._before_page(self._client.download, fetched, warned)
             try:
                 response = await self._client.request(method, path, params=params, policy=policy)
             except NoDataInRangeError:
@@ -691,6 +731,7 @@ class AsyncReplay(_ReplayBase):
                     "GET /v1/download/orderbook did not return JSON",
                     request_id=response.headers.get("x-request-id"),
                 ) from None
+            fetched += len(body) if isinstance(body, list) else 0
             for state in pager.accept(body):
                 served.add(state.outcome or state.token_id)
                 if self._wanted(state):
@@ -721,7 +762,7 @@ class AsyncReplay(_ReplayBase):
         hi = self._target(when)
         span = self._lookback(lookback)
         while True:
-            lo = max(self.start, hi - span)
+            lo = self.start if span >= hi - self.start else hi - span
             latest: Dict[str, BookState] = {}
             async for state in self._fetch(lo, hi):
                 latest[state.token_id] = state

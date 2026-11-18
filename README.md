@@ -168,9 +168,12 @@ replay the per-update delta tape, because that is only served venue-wide.
 
 **It is metered.** Each page (`page_size`, default 2,500 rows, about 5 MB) is an
 orderbook download. It counts toward your fair-use volume and the download rate
-limit, and iterating twice downloads twice. `client.download.confirm_cost` and the
-cost warning are checked before every page, at the price of one page; the total
-depends on how many snapshots the window holds. A page the rate limiter refuses
+limit, and iterating twice downloads twice. The route has no outcome filter, so
+`outcome=` / `token_id=` are applied after download: every outcome's rows are
+fetched and metered. The cost warning and `client.download.confirm_cost` are
+checked before every page against the running total, so a long replay of small
+pages still warns (once) and still asks the hook. `at()` downloads only a short
+window before `when` (5 minutes first, doubling until a snapshot turns up). A page the rate limiter refuses
 is waited out and retried, since nothing was served or charged. Nothing else is
 retried, and a billing quota (`QuotaExceededError`) never is. An empty window is an
 empty replay, not an error.

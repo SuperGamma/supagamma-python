@@ -659,3 +659,64 @@ async def test_async_to_pandas(aclient):
     with router:
         frame = await aclient.replay("1254468", T0, at(60)).to_pandas()
     assert set(frame.token_id) == {"tY", "tN"}
+
+
+# --- review round 2 ----------------------------------------------------------------------
+
+
+def test_many_small_pages_still_reach_the_cost_warning_once(client):
+    from supagamma.resources.download import CostWarning
+
+    # Default pages are each just under the warning line; the running total is not.
+    rows = [r for s in range(0, 2_600 * 5, 5) for r in pair(s)]
+    router, fake = serve(rows)
+    with router, pytest.warns(CostWarning) as record:
+        books = list(client.replay("1254468", T0, T0 + timedelta(days=1)))
+    assert len(books) == len(rows)
+    assert len(fake.calls) == 3
+    assert len([w for w in record if issubclass(w.category, CostWarning)]) == 1
+
+
+def test_a_cut_on_the_cursor_advances_to_the_oldest_later_timestamp():
+    from supagamma.replay import _Pager
+
+    pager = _Pager("1", at(0), at(600), page_size=4)
+    # Storage order: a late row at the cursor tick ends the page.
+    out = pager.accept([row(0), row(30), row(90), row(0, "tN", "No")])
+    assert pager.cursor == at(30)
+    assert [b.timestamp for b in out] == [at(0), at(0)]
+
+
+@pytest.mark.parametrize(
+    "text, micros",
+    [
+        ("2026-11-01T12:00:00.5Z", 500_000),
+        ("2026-11-01T12:00:00.1234567+00:00", 123_456),
+        ("2026-11-01T12:00:00.12Z", 120_000),
+    ],
+)
+def test_any_number_of_fractional_digits_parses_on_every_python(client, text, micros):
+    replay = client.replay("1254468", text, at(60))
+    assert replay.start == T0.replace(microsecond=micros)
+
+
+@pytest.mark.parametrize("bad", [0, -1, 1e300, float("inf")])
+def test_lookback_errors_name_lookback_and_never_overflow(client, bad):
+    replay = _replay(client)
+    with pytest.raises(ValueError, match="lookback"):
+        replay.at(at(60), lookback=bad)
+
+
+def test_a_huge_interval_is_a_value_error(client):
+    with pytest.raises(ValueError, match="interval"):
+        client.replay("1254468", T0, at(60), interval=1e300)
+
+
+def test_a_capture_gap_for_the_wanted_outcome_widens_instead_of_failing(client):
+    # Only "No" was captured in the last few minutes; "Yes" last appears earlier.
+    rows = pair(0, bid=0.30) + [row(s, "tN", "No") for s in range(1200, 1800, 60)]
+    router, fake = serve(rows)
+    with router:
+        book = _replay(client).at(at(1790))
+    assert book is not None and book.timestamp == at(0) and book.token_id == "tY"
+    assert len(fake.calls) > 1
