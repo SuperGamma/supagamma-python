@@ -842,19 +842,66 @@ def test_an_outcome_is_resolved_to_its_token_and_filtered_by_the_server(client):
     assert markets == 1  # resolved once per replay
 
 
-def test_a_server_filtered_row_is_kept_even_if_its_outcome_label_differs(client):
-    rows = [dict(r, outcome="YES-label") for r in kpair(0) if r["token_id"] == "111"]
-    router, _ = serve_keyset(rows + kpair(30))
+def test_a_token_mapping_that_contradicts_the_capture_label_is_an_error(client):
+    # The record says Yes -> 111, but the capture labels 111 "No": a swapped mapping.
+    swapped = dict(MARKET, outcome_token_ids=["222", "111"])
+    router, _ = serve_keyset(kpair(0) + kpair(30), market=swapped)
+    with router, pytest.raises(ValueError, match="token_id="):
+        list(client.replay("1254468", T0, at(60), outcome="Yes"))
+
+
+def test_a_failed_market_lookup_falls_back_to_the_client_side_filter(client):
+    router, fake = serve_keyset(kpair(0) + kpair(30))
+    router.routes[1].mock(return_value=httpx.Response(500, text="boom"))
     with router:
         books = list(client.replay("1254468", T0, at(60), outcome="Yes"))
+    assert [b.token_id for b in books] == ["111", "111"]
+    assert "token_id" not in fake.calls[0]
+
+
+def test_a_cursor_page_ending_inside_a_tick_is_not_a_false_no_match(client):
+    # Three outcomes, filtered client-side; page 1 holds only A and B of tick 0.
+    rows = [
+        row(s, tok, name) for s in (0, 30) for tok, name in (("1", "A"), ("2", "B"), ("3", "C"))
+    ]
+    router, fake = serve_keyset(rows, market=None)
+    with router:
+        books = list(client.replay("1254468", T0, at(60), outcome="C", page_size=2))
     assert [b.timestamp for b in books] == [at(0), at(30)]
 
 
-def test_an_outcome_the_market_lacks_fails_before_any_download(client):
-    router, fake = serve_keyset(kpair(0))
+@pytest.mark.parametrize("more", [None, "true", 1])
+def test_a_non_boolean_has_more_is_a_shape_error(client, more):
+    meta: Dict[str, Any] = {"next_cursor": "c0"}
+    if more is not None:
+        meta["has_more"] = more
+    with respx.mock(base_url=BASE) as router:
+        router.get(PATH).mock(
+            return_value=httpx.Response(200, json={"data": kpair(0), "meta": meta})
+        )
+        with pytest.raises(ResponseShapeError, match="has_more"):
+            list(client.replay("1254468", T0, at(60)))
+
+
+def test_cycling_cursors_stop_instead_of_looping(client):
+    pages = [
+        {"data": kpair(s), "meta": {"has_more": True, "next_cursor": c}}
+        for s, c in ((0, "A"), (30, "B"), (60, "A"))
+    ]
+    with respx.mock(base_url=BASE) as router:
+        route = router.get(PATH).mock(side_effect=[httpx.Response(200, json=p) for p in pages])
+        with pytest.raises(SupaGammaError, match="same page cursor"):
+            list(client.replay("1254468", T0, at(120)))
+    assert route.call_count == 3
+
+
+def test_an_outcome_the_record_lacks_falls_back_and_fails_after_one_page(client):
+    # The record's names can differ from the capture labels, so an unknown name
+    # is matched against the rows instead, and fails on the first page.
+    router, fake = serve_keyset(kpair(0) + kpair(30))
     with router, pytest.raises(ValueError, match=r"\['No', 'Yes'\]") as raised:
         list(client.replay("1254468", T0, at(60), outcome="Maybe"))
-    assert fake.calls == []
+    assert len(fake.calls) == 1 and "token_id" not in fake.calls[0]
     assert "Maybe" not in str(raised.value)
 
 

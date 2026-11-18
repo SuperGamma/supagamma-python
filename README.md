@@ -169,8 +169,10 @@ replay the per-update delta tape, because that is only served venue-wide.
 Where the API supports it, replay pages with the server's cursor (`paginate=true`)
 and asks for one outcome's rows only (`token_id`). An `outcome=` name is turned
 into its token id with one `client.markets.get` call. On an API without those
-parameters, replay pages by time and filters outcomes after download instead.
-Either way you get the same books; the first response decides which path is used.
+parameters, replay pages by time and filters outcomes after download instead;
+the first response decides which. The cursor is the more complete of the two: time
+paging needs a `page_size` larger than one capture tick, and cannot reach a row the
+capture wrote late, behind a page it has already passed.
 
 **It is metered.** Each page (`page_size`, default 2,500 rows, about 5 MB) is an
 orderbook download. It counts toward your fair-use volume and the download rate

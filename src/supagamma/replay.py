@@ -68,9 +68,10 @@ from typing import (
 
 from ._client import RetryPolicy
 from ._errors import (
+    APIConnectionError,
+    APIStatusError,
     MissingDependencyError,
     NoDataInRangeError,
-    NotFoundError,
     ResponseShapeError,
     SupaGammaError,
 )
@@ -371,6 +372,7 @@ class _Pager:
         #: None until the first answer shows which paging the server speaks.
         self.keyset: Optional[bool] = None
         self.next_cursor: Optional[str] = None
+        self._cursors_seen: Set[str] = set()
         self._key_start = start
         self._sent_start = start
 
@@ -446,15 +448,21 @@ class _Pager:
         fresh = [s for s in states if self._key_start <= s.timestamp <= self.end]
         fresh.sort(key=lambda s: (s.timestamp, s.token_id))
         nxt = meta.get("next_cursor")
-        if meta.get("has_more") is True:
+        more = meta.get("has_more")
+        if not isinstance(more, bool):
+            raise ResponseShapeError(
+                "GET /v1/download/orderbook sent a page without a boolean has_more"
+            )
+        if more:
             if not isinstance(nxt, str) or not nxt:
                 raise ResponseShapeError(
                     "GET /v1/download/orderbook said has_more but sent no next_cursor"
                 )
-            if nxt == self.next_cursor:
+            if nxt in self._cursors_seen:
                 raise SupaGammaError(
                     "the server returned the same page cursor twice; stopping the replay"
                 )
+            self._cursors_seen.add(nxt)
             self.next_cursor = nxt
         else:
             self.done = True
@@ -548,8 +556,9 @@ class _ReplayBase:
         """The token id of ``self.outcome``, from a ``markets.get`` record.
 
         ``outcome_token_ids`` is parallel to ``outcomes``. None when the record
-        does not carry a usable mapping (then the filter stays client-side). An
-        outcome the market does not have raises before anything is downloaded.
+        does not carry a usable mapping, or does not list the outcome: the record's
+        names can differ from the capture's labels, so the filter then stays
+        client-side, matching the labels on the rows.
         """
         if self.outcome is None or not isinstance(market, dict):
             return None
@@ -561,7 +570,7 @@ class _ReplayBase:
         for name, token in zip(outcomes, tokens):
             if str(name).strip().lower() == self.outcome.lower():
                 return token if _is_token_id(token) else None
-        raise self._no_match({str(name) for name in outcomes})
+        return None
 
     def _direct_token(self) -> Optional[str]:
         # A token id the route would refuse (not decimal) is filtered client-side.
@@ -594,17 +603,29 @@ class _ReplayBase:
             warnings.warn(message, CostWarning, stacklevel=4)
         return True
 
-    def _check_page(self, served: Set[str], matched: bool) -> None:
-        # Pages carry whole capture ticks, and a tick normally holds every
-        # outcome. So a page that served two or more outcomes and matched none
-        # means the filter matches nothing: stop now instead of downloading the
-        # rest of the window. With one outcome served it may be a capture gap
-        # for the wanted one, so keep going.
-        if len(served) >= 2 and not matched:
+    def _check_page(self, served: Set[str], matched: bool, past_first_tick: bool) -> None:
+        # A capture tick normally holds every outcome. Once rows from a second
+        # tick have arrived, the first tick is complete, so two or more outcomes
+        # served with none matched means the filter matches nothing: stop now
+        # instead of downloading the rest of the window. Before that (a cursor
+        # page can end inside a tick), or with one outcome served (maybe a
+        # capture gap for the wanted one), keep going.
+        if past_first_tick and len(served) >= 2 and not matched:
             raise self._no_match(served)
 
     def _wanted(self, state: BookState) -> bool:
         if self._server_token is not None and state.token_id == self._server_token:
+            if (
+                self.outcome is not None
+                and state.outcome is not None
+                and state.outcome.strip().lower() != self.outcome.lower()
+            ):
+                # The record's outcome -> token mapping disagrees with the capture.
+                # Serving that book as the requested outcome would be silently wrong.
+                raise ValueError(
+                    "the market record maps this outcome to a token whose snapshots are "
+                    f"labeled {state.outcome!r}. Pass token_id= to pick the token directly."
+                )
             return True
         if self.token_id is not None:
             return state.token_id == self.token_id
@@ -721,8 +742,11 @@ class Replay(_ReplayBase):
             if self.outcome is not None:
                 try:
                     market = self._client.markets.get(self.market_id)
-                except NotFoundError:
-                    market = None  # e.g. a token id passed as market_id
+                except (APIStatusError, APIConnectionError, ResponseShapeError):
+                    # An optimisation only: if the lookup fails (unknown id, a
+                    # token id passed as market_id, throttled, down), filter
+                    # client-side. The orderbook route reports its own errors.
+                    market = None
                 token = self._token_from_market(market)
             self._server_token = token
             self._resolved = True
@@ -734,6 +758,8 @@ class Replay(_ReplayBase):
         matched = False
         fetched = 0
         warned = False
+        first_tick: Optional[datetime] = None
+        past_first_tick = False
         while not pager.done:
             method, path, params, policy = pager.call()
             warned = self._before_page(self._client.download, fetched, warned)
@@ -752,10 +778,16 @@ class Replay(_ReplayBase):
             fetched += _rows_in(body)
             for state in pager.accept(body):
                 served.add(state.outcome or state.token_id)
+                if first_tick is None:
+                    first_tick = state.timestamp
+                elif state.timestamp != first_tick:
+                    past_first_tick = True
                 if self._wanted(state):
                     matched = True
                     yield state
-            self._check_page(served, matched)
+            self._check_page(served, matched, past_first_tick)
+        # The walk is over, so its last tick is complete too.
+        self._check_page(served, matched, True)
 
     def snapshots(self) -> Iterator[BookState]:
         """Every snapshot in the window, oldest first (ignores ``interval``)."""
@@ -856,8 +888,8 @@ class AsyncReplay(_ReplayBase):
             if self.outcome is not None:
                 try:
                     market = await self._client.markets.get(self.market_id)
-                except NotFoundError:
-                    market = None
+                except (APIStatusError, APIConnectionError, ResponseShapeError):
+                    market = None  # see Replay._resolve
                 token = self._token_from_market(market)
             self._server_token = token
             self._resolved = True
@@ -869,6 +901,8 @@ class AsyncReplay(_ReplayBase):
         matched = False
         fetched = 0
         warned = False
+        first_tick: Optional[datetime] = None
+        past_first_tick = False
         while not pager.done:
             method, path, params, policy = pager.call()
             warned = self._before_page(self._client.download, fetched, warned)
@@ -887,10 +921,16 @@ class AsyncReplay(_ReplayBase):
             fetched += _rows_in(body)
             for state in pager.accept(body):
                 served.add(state.outcome or state.token_id)
+                if first_tick is None:
+                    first_tick = state.timestamp
+                elif state.timestamp != first_tick:
+                    past_first_tick = True
                 if self._wanted(state):
                     matched = True
                     yield state
-            self._check_page(served, matched)
+            self._check_page(served, matched, past_first_tick)
+        # The walk is over, so its last tick is complete too.
+        self._check_page(served, matched, True)
 
     def snapshots(self) -> AsyncIterator[BookState]:
         """Every snapshot in the window, oldest first (ignores ``interval``)."""
