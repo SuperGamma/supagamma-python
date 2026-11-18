@@ -166,11 +166,17 @@ Replay reads the market's captured L2 **snapshots** (`GET /v1/download/orderbook
 every 5 s to 15 min depending on how close the market is to expiry. It does not
 replay the per-update delta tape, because that is only served venue-wide.
 
+Where the API supports it, replay pages with the server's cursor (`paginate=true`)
+and asks for one outcome's rows only (`token_id`). An `outcome=` name is turned
+into its token id with one `client.markets.get` call. On an API without those
+parameters, replay pages by time and filters outcomes after download instead.
+Either way you get the same books; the first response decides which path is used.
+
 **It is metered.** Each page (`page_size`, default 2,500 rows, about 5 MB) is an
 orderbook download. It counts toward your fair-use volume and the download rate
-limit, and iterating twice downloads twice. The route has no outcome filter, so
-`outcome=` / `token_id=` are applied after download: every outcome's rows are
-fetched and metered. The cost warning and `client.download.confirm_cost` are
+limit, and iterating twice downloads twice. With the server-side outcome filter
+only the outcome you asked for is metered; without it (an older API, or an outcome
+that cannot be mapped to a token id) every outcome's rows are fetched and metered. The cost warning and `client.download.confirm_cost` are
 checked before every page against the running total, so a long replay of small
 pages still warns (once) and still asks the hook. `at()` downloads only a short
 window before `when` (5 minutes first, doubling until a snapshot turns up). A page the rate limiter refuses

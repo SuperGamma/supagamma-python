@@ -23,6 +23,15 @@ rebuilt from deltas: the per-update delta tape (``polymarket_l2_deltas``) is
 only served venue-wide, with no per-market filter, so replaying one market from
 it would mean downloading the whole venue.
 
+**Server-side paging and outcome filter, when the API offers them.** Every
+request asks for keyset paging (``paginate=true``, then the server's
+``next_cursor``) and, when the outcome is known, for that outcome's
+``token_id`` only, so the other outcomes are neither served nor metered. An
+``outcome`` name is turned into its token id from ``client.markets.get`` (one
+free read). An API that predates these parameters ignores them and answers
+with a bare row list; replay then pages by time and filters outcomes after
+download, as it always has. Both work, and the first answer decides which.
+
 **It is metered.** Every page is an ordinary orderbook download: it counts
 toward your plan's fair-use volume (or is billed per MB on a pay-as-you-go
 deployment) and toward the download rate limit. Narrow the window, and pick
@@ -58,7 +67,13 @@ from typing import (
 )
 
 from ._client import RetryPolicy
-from ._errors import MissingDependencyError, NoDataInRangeError, ResponseShapeError, SupaGammaError
+from ._errors import (
+    MissingDependencyError,
+    NoDataInRangeError,
+    NotFoundError,
+    ResponseShapeError,
+    SupaGammaError,
+)
 from .resources import download as _download
 from .resources._base import Call
 from .resources.download import CostWarning, build_orderbook, estimate_cost_usd
@@ -308,10 +323,25 @@ def parse_row(row: Any) -> BookState:
 # --- paging (pure state machine) -----------------------------------------------
 
 
+_TOKEN_RE = re.compile(r"^[0-9]{1,80}$")
+
+
+def _is_token_id(value: Any) -> bool:
+    """The shape the route accepts for ``token_id`` (decimal digits)."""
+    return isinstance(value, str) and _TOKEN_RE.match(value) is not None
+
+
 class _Pager:
     """Walks ``[start, end]`` one page at a time, oldest first, with no gaps or repeats.
 
-    The route has no cursor, only ``start``/``end``/``limit``, and returns the
+    **Keyset mode** (an API that answers ``paginate=true`` with
+    ``{data, meta: {next_cursor, has_more}}``): the server orders rows by
+    ``(timestamp, token_id, ...)`` and hands back a signed cursor bound to the
+    request's ``start``/``end``/``token_id``. Each next page repeats those and
+    adds the cursor, until ``has_more`` is false.
+
+    **Time mode** (an older API that ignores ``paginate`` and returns a bare
+    list). The route then has no cursor, only ``start``/``end``/``limit``, and returns the
     *first* ``limit`` matching rows in storage order (day files in date order,
     rows in the order they were written), not sorted by time. So when a page
     comes back full, the next page starts AT the timestamp of the page's LAST
@@ -324,21 +354,43 @@ class _Pager:
     ``(timestamp, token_id)`` order.
     """
 
-    def __init__(self, market_id: str, start: datetime, end: datetime, page_size: int) -> None:
+    def __init__(
+        self,
+        market_id: str,
+        start: datetime,
+        end: datetime,
+        page_size: int,
+        token_id: Optional[str] = None,
+    ) -> None:
         self.market_id = market_id
         self.cursor = start
         self.end = end
         self.page_size = page_size
+        self.token_id = token_id
         self.done = False
+        #: None until the first answer shows which paging the server speaks.
+        self.keyset: Optional[bool] = None
+        self.next_cursor: Optional[str] = None
+        self._key_start = start
+        self._sent_start = start
 
     def call(self) -> Call:
+        # In keyset mode the cursor is bound to the window it was issued for,
+        # so start stays where the keyset walk began; in time mode it moves.
+        start = self._key_start if self.keyset else self.cursor
+        self._sent_start = start
         method, path, params, _ = build_orderbook(
             market_id=self.market_id,
-            start=self.cursor,
+            start=start,
             end=self.end,
             format="json",
             limit=self.page_size,
         )
+        params["paginate"] = True
+        if self.token_id is not None:
+            params["token_id"] = self.token_id
+        if self.keyset and self.next_cursor is not None:
+            params["cursor"] = self.next_cursor
         return method, path, params, REPLAY_RETRY
 
     def empty(self) -> None:
@@ -346,8 +398,16 @@ class _Pager:
         self.done = True
 
     def accept(self, body: Any) -> List[BookState]:
+        if isinstance(body, dict):
+            return self._accept_keyset(body)
         if not isinstance(body, list):
             raise ResponseShapeError("GET /v1/download/orderbook did not return a JSON list")
+        if self.keyset:
+            # A bare list mid keyset walk: the server changed under us.
+            raise ResponseShapeError(
+                "GET /v1/download/orderbook stopped paging by cursor in the middle of a replay"
+            )
+        self.keyset = False
         states = [parse_row(row) for row in body]
         fresh = [s for s in states if self.cursor <= s.timestamp <= self.end]
         fresh.sort(key=lambda s: (s.timestamp, s.token_id))
@@ -370,6 +430,44 @@ class _Pager:
             )
         self.cursor = nxt
         return [s for s in fresh if s.timestamp < nxt]
+
+    def _accept_keyset(self, body: Dict[str, Any]) -> List[BookState]:
+        data, meta = body.get("data"), body.get("meta")
+        if not isinstance(data, list) or not isinstance(meta, dict):
+            raise ResponseShapeError(
+                "GET /v1/download/orderbook returned an object without a data list and meta"
+            )
+        if not self.keyset:
+            # First keyset answer (possibly after time-mode pages, if the API
+            # was deployed mid-walk): the cursor is bound to the start just sent.
+            self.keyset = True
+            self._key_start = self._sent_start
+        states = [parse_row(row) for row in data]
+        fresh = [s for s in states if self._key_start <= s.timestamp <= self.end]
+        fresh.sort(key=lambda s: (s.timestamp, s.token_id))
+        nxt = meta.get("next_cursor")
+        if meta.get("has_more") is True:
+            if not isinstance(nxt, str) or not nxt:
+                raise ResponseShapeError(
+                    "GET /v1/download/orderbook said has_more but sent no next_cursor"
+                )
+            if nxt == self.next_cursor:
+                raise SupaGammaError(
+                    "the server returned the same page cursor twice; stopping the replay"
+                )
+            self.next_cursor = nxt
+        else:
+            self.done = True
+        return fresh
+
+
+def _rows_in(body: Any) -> int:
+    """How many rows a page carried, in either response shape (for the cost guard)."""
+    if isinstance(body, list):
+        return len(body)
+    if isinstance(body, dict) and isinstance(body.get("data"), list):
+        return len(body["data"])
+    return 0
 
 
 # --- the interval grid (pure) ----------------------------------------------------
@@ -443,6 +541,31 @@ class _ReplayBase:
         self.token_id = token_id.strip() if token_id is not None else None
         self.interval = _parse_interval(interval)
         self.page_size = _check_page_size(page_size)
+        self._resolved = False
+        self._server_token: Optional[str] = None
+
+    def _token_from_market(self, market: Any) -> Optional[str]:
+        """The token id of ``self.outcome``, from a ``markets.get`` record.
+
+        ``outcome_token_ids`` is parallel to ``outcomes``. None when the record
+        does not carry a usable mapping (then the filter stays client-side). An
+        outcome the market does not have raises before anything is downloaded.
+        """
+        if self.outcome is None or not isinstance(market, dict):
+            return None
+        outcomes, tokens = market.get("outcomes"), market.get("outcome_token_ids")
+        if not isinstance(outcomes, list) or not isinstance(tokens, list):
+            return None
+        if not outcomes or len(outcomes) != len(tokens):
+            return None
+        for name, token in zip(outcomes, tokens):
+            if str(name).strip().lower() == self.outcome.lower():
+                return token if _is_token_id(token) else None
+        raise self._no_match({str(name) for name in outcomes})
+
+    def _direct_token(self) -> Optional[str]:
+        # A token id the route would refuse (not decimal) is filtered client-side.
+        return self.token_id if _is_token_id(self.token_id) else None
 
     def _before_page(self, download: Any, fetched: int, warned: bool) -> bool:
         """The download cost check, run before EACH page, on the running total.
@@ -481,6 +604,8 @@ class _ReplayBase:
             raise self._no_match(served)
 
     def _wanted(self, state: BookState) -> bool:
+        if self._server_token is not None and state.token_id == self._server_token:
+            return True
         if self.token_id is not None:
             return state.token_id == self.token_id
         if self.outcome is not None:
@@ -589,8 +714,22 @@ class Replay(_ReplayBase):
             page_size=page_size,
         )
 
+    def _resolve(self) -> Optional[str]:
+        """The token id to filter on server-side, worked out once per replay."""
+        if not self._resolved:
+            token = self._direct_token()
+            if self.outcome is not None:
+                try:
+                    market = self._client.markets.get(self.market_id)
+                except NotFoundError:
+                    market = None  # e.g. a token id passed as market_id
+                token = self._token_from_market(market)
+            self._server_token = token
+            self._resolved = True
+        return self._server_token
+
     def _fetch(self, start: datetime, end: datetime) -> Iterator[BookState]:
-        pager = _Pager(self.market_id, start, end, self.page_size)
+        pager = _Pager(self.market_id, start, end, self.page_size, self._resolve())
         served: Set[str] = set()
         matched = False
         fetched = 0
@@ -610,7 +749,7 @@ class Replay(_ReplayBase):
                     "GET /v1/download/orderbook did not return JSON",
                     request_id=response.headers.get("x-request-id"),
                 ) from None
-            fetched += len(body) if isinstance(body, list) else 0
+            fetched += _rows_in(body)
             for state in pager.accept(body):
                 served.add(state.outcome or state.token_id)
                 if self._wanted(state):
@@ -710,8 +849,22 @@ class AsyncReplay(_ReplayBase):
             page_size=page_size,
         )
 
+    async def _resolve(self) -> Optional[str]:
+        """See :meth:`Replay._resolve`."""
+        if not self._resolved:
+            token = self._direct_token()
+            if self.outcome is not None:
+                try:
+                    market = await self._client.markets.get(self.market_id)
+                except NotFoundError:
+                    market = None
+                token = self._token_from_market(market)
+            self._server_token = token
+            self._resolved = True
+        return self._server_token
+
     async def _fetch(self, start: datetime, end: datetime) -> AsyncIterator[BookState]:
-        pager = _Pager(self.market_id, start, end, self.page_size)
+        pager = _Pager(self.market_id, start, end, self.page_size, await self._resolve())
         served: Set[str] = set()
         matched = False
         fetched = 0
@@ -731,7 +884,7 @@ class AsyncReplay(_ReplayBase):
                     "GET /v1/download/orderbook did not return JSON",
                     request_id=response.headers.get("x-request-id"),
                 ) from None
-            fetched += len(body) if isinstance(body, list) else 0
+            fetched += _rows_in(body)
             for state in pager.accept(body):
                 served.add(state.outcome or state.token_id)
                 if self._wanted(state):

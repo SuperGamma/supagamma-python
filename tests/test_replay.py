@@ -103,11 +103,91 @@ def client() -> Iterator[SupaGamma]:
     c.close()
 
 
-def serve(rows: List[Dict[str, Any]]) -> Any:
+MARKET_PATH = "/v1/markets/1254468"
+#: The market record's outcome mapping, as GET /v1/markets/{id} serves it.
+MARKET = {"id": "1254468", "outcomes": ["Yes", "No"], "outcome_token_ids": ["111", "222"]}
+
+
+def serve(rows: List[Dict[str, Any]], market: Optional[Dict[str, Any]] = None) -> Any:
+    """An API from BEFORE keyset paging: it ignores paginate/cursor/token_id.
+
+    The market lookup answers 404 unless a record is given, so outcome filters
+    stay client-side, exactly as on that API.
+    """
     fake = FakeOrderbookRoute(rows)
     router = respx.mock(base_url=BASE, assert_all_called=False)
     router.get(PATH).mock(side_effect=fake)
+    if market is None:
+        router.get(MARKET_PATH).mock(
+            return_value=httpx.Response(404, json={"detail": "Market not found"})
+        )
+    else:
+        router.get(MARKET_PATH).mock(return_value=httpx.Response(200, json=market))
     return router, fake
+
+
+class FakeKeysetRoute:
+    """An API WITH keyset paging and the token_id filter (SuperGamma/supagamma#384).
+
+    Rows ordered by (timestamp, token_id); a cursor is bound to the request's
+    start/end/token_id, which is checked on every page; a 404 only for an empty
+    first page; the last page says has_more=false.
+    """
+
+    def __init__(self, rows: List[Dict[str, Any]]) -> None:
+        self.rows = sorted(rows, key=lambda r: (r["timestamp"], r["token_id"]))
+        self.calls: List[Dict[str, str]] = []
+        self.cursors: Dict[str, Any] = {}
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        query = {k: v[0] for k, v in parse_qs(urlparse(str(request.url)).query).items()}
+        self.calls.append(query)
+        assert query.get("paginate") == "true" or "cursor" in query
+        start = datetime.fromisoformat(query["start"]).astimezone(UTC).isoformat()
+        end = datetime.fromisoformat(query["end"]).astimezone(UTC).isoformat()
+        token = query.get("token_id")
+        binding = (start, end, token)
+        offset = 0
+        if "cursor" in query:
+            bound, offset = self.cursors[query["cursor"]]
+            assert bound == binding, "a cursor must be replayed with its own window"
+        limit = int(query["limit"])
+        hits = [
+            r
+            for r in self.rows
+            if start <= r["timestamp"] <= end and (token is None or r["token_id"] == token)
+        ]
+        if not hits and "cursor" not in query:
+            return httpx.Response(404, json={"detail": "No orderbook snapshots in this range"})
+        page = hits[offset : offset + limit]
+        more = offset + limit < len(hits)
+        nxt = None
+        if more:
+            nxt = f"c{len(self.cursors)}"
+            self.cursors[nxt] = (binding, offset + limit)
+        meta = {"next_cursor": nxt, "has_more": more, "count": len(page), "limit": limit}
+        return httpx.Response(200, json={"data": page, "meta": meta})
+
+
+def serve_keyset(rows: List[Dict[str, Any]], market: Optional[Dict[str, Any]] = MARKET) -> Any:
+    fake = FakeKeysetRoute(rows)
+    router = respx.mock(base_url=BASE, assert_all_called=False)
+    router.get(PATH).mock(side_effect=fake)
+    if market is None:
+        router.get(MARKET_PATH).mock(
+            return_value=httpx.Response(404, json={"detail": "Market not found"})
+        )
+    else:
+        router.get(MARKET_PATH).mock(return_value=httpx.Response(200, json=market))
+    return router, fake
+
+
+def kpair(seconds: float, bid: float = 0.40) -> List[Dict[str, Any]]:
+    """A capture tick with decimal token ids, as the real data has."""
+    return [
+        dict(row(seconds, "111", "Yes", bid=bid, ask=bid + 0.2)),
+        dict(row(seconds, "222", "No", bid=round(0.6 - bid, 2), ask=round(0.8 - bid, 2))),
+    ]
 
 
 # --- parsing -----------------------------------------------------------------------
@@ -720,3 +800,156 @@ def test_a_capture_gap_for_the_wanted_outcome_widens_instead_of_failing(client):
         book = _replay(client).at(at(1790))
     assert book is not None and book.timestamp == at(0) and book.token_id == "tY"
     assert len(fake.calls) > 1
+
+
+# --- server-side paging and token filter (API with keyset paging) ------------------------
+
+
+def test_keyset_paging_walks_by_cursor_with_a_fixed_window(client):
+    rows = [r for s in range(0, 300, 30) for r in kpair(s)]
+    router, fake = serve_keyset(rows)
+    with router:
+        books = list(client.replay("1254468", T0, at(600), page_size=3))
+    got = [(b.timestamp, b.token_id) for b in books]
+    assert got == sorted(got) and len(got) == len(set(got)) == len(rows)
+    assert len(fake.calls) == 7  # 20 rows, 3 a page
+    assert all(c["start"] == fake.calls[0]["start"] for c in fake.calls)
+    assert all(c["paginate"] == "true" for c in fake.calls)
+    assert "cursor" not in fake.calls[0]
+    assert [c.get("cursor") for c in fake.calls[1:]] == [f"c{i}" for i in range(6)]
+    assert all("token_id" not in c for c in fake.calls)
+
+
+def test_keyset_paging_has_no_page_size_floor(client):
+    # Time-edge paging needs a page bigger than one tick; a cursor does not.
+    rows = [r for s in range(0, 90, 30) for r in kpair(s)]
+    router, _ = serve_keyset(rows)
+    with router:
+        books = list(client.replay("1254468", T0, at(600), page_size=1))
+    assert len(books) == len(rows)
+
+
+def test_an_outcome_is_resolved_to_its_token_and_filtered_by_the_server(client):
+    rows = [r for s in range(0, 120, 30) for r in kpair(s)]
+    router, fake = serve_keyset(rows)
+    with router:
+        replay = client.replay("1254468", T0, at(600), outcome="yes", page_size=3)
+        books = list(replay)
+        again = list(replay)
+        markets = router.routes[1].call_count
+    assert [b.token_id for b in books] == ["111"] * 4 and len(again) == 4
+    assert all(c["token_id"] == "111" for c in fake.calls)
+    assert markets == 1  # resolved once per replay
+
+
+def test_a_server_filtered_row_is_kept_even_if_its_outcome_label_differs(client):
+    rows = [dict(r, outcome="YES-label") for r in kpair(0) if r["token_id"] == "111"]
+    router, _ = serve_keyset(rows + kpair(30))
+    with router:
+        books = list(client.replay("1254468", T0, at(60), outcome="Yes"))
+    assert [b.timestamp for b in books] == [at(0), at(30)]
+
+
+def test_an_outcome_the_market_lacks_fails_before_any_download(client):
+    router, fake = serve_keyset(kpair(0))
+    with router, pytest.raises(ValueError, match=r"\['No', 'Yes'\]") as raised:
+        list(client.replay("1254468", T0, at(60), outcome="Maybe"))
+    assert fake.calls == []
+    assert "Maybe" not in str(raised.value)
+
+
+def test_a_decimal_token_id_is_sent_and_others_stay_client_side(client):
+    router, fake = serve_keyset(kpair(0) + kpair(30))
+    with router:
+        assert len(list(client.replay("1254468", T0, at(60), token_id="222"))) == 2
+    assert fake.calls[0]["token_id"] == "222"
+    router, fake = serve(pair(0))
+    with router:
+        assert len(list(client.replay("1254468", T0, at(60), token_id="tN"))) == 1
+    assert "token_id" not in fake.calls[0]
+
+
+def test_no_outcome_mapping_keeps_the_client_side_filter(client):
+    router, fake = serve_keyset(kpair(0), market=None)
+    with router:
+        books = list(client.replay("1254468", T0, at(60), outcome="No"))
+    assert [b.token_id for b in books] == ["222"]
+    assert "token_id" not in fake.calls[0]
+
+
+def test_an_old_api_that_ignores_the_new_params_still_replays(client):
+    # serve() is the pre-keyset API: bare lists, paginate/token_id ignored.
+    rows = [r for s in range(0, 300, 30) for r in kpair(s)]
+    router, fake = serve(rows, market=MARKET)
+    with router:
+        books = list(client.replay("1254468", T0, at(600), outcome="Yes", page_size=5))
+    assert [b.timestamp for b in books] == [at(s) for s in range(0, 300, 30)]
+    assert all(b.token_id == "111" for b in books)
+    assert all(c["paginate"] == "true" and c["token_id"] == "111" for c in fake.calls)
+    starts = [c["start"] for c in fake.calls]
+    assert starts == sorted(starts) and len(set(starts)) > 1  # time-edge paging
+
+
+def test_an_api_deployed_mid_walk_switches_to_the_cursor_without_gaps(client):
+    rows = [r for s in range(0, 300, 30) for r in kpair(s)]
+    old, new = FakeOrderbookRoute(rows), FakeKeysetRoute(rows)
+    answers = iter([old, new, new, new, new, new, new, new, new])
+    with respx.mock(base_url=BASE, assert_all_called=False) as router:
+        router.get(PATH).mock(side_effect=lambda request: next(answers)(request))
+        books = list(client.replay("1254468", T0, at(600), page_size=5))
+    got = [(b.timestamp, b.token_id) for b in books]
+    assert got == sorted(got) and len(got) == len(set(got)) == len(rows)
+    # The keyset walk keeps the start it began at, which the old page had moved.
+    assert new.calls[0]["start"] != old.calls[0]["start"]
+    assert {c["start"] for c in new.calls} == {new.calls[0]["start"]}
+
+
+def test_has_more_without_a_cursor_is_a_shape_error(client):
+    with respx.mock(base_url=BASE) as router:
+        router.get(PATH).mock(
+            return_value=httpx.Response(
+                200, json={"data": kpair(0), "meta": {"has_more": True, "next_cursor": None}}
+            )
+        )
+        with pytest.raises(ResponseShapeError, match="next_cursor"):
+            list(client.replay("1254468", T0, at(60)))
+
+
+def test_a_repeated_cursor_stops_instead_of_looping(client):
+    body = {"data": kpair(0), "meta": {"has_more": True, "next_cursor": "same"}}
+    with respx.mock(base_url=BASE) as router:
+        route = router.get(PATH).mock(return_value=httpx.Response(200, json=body))
+        with pytest.raises(SupaGammaError, match="same page cursor"):
+            list(client.replay("1254468", T0, at(60)))
+    assert route.call_count == 2
+
+
+def test_a_bare_list_in_the_middle_of_a_cursor_walk_is_a_shape_error(client):
+    first = {"data": kpair(0), "meta": {"has_more": True, "next_cursor": "c0"}}
+    with respx.mock(base_url=BASE) as router:
+        router.get(PATH).mock(
+            side_effect=[httpx.Response(200, json=first), httpx.Response(200, json=kpair(30))]
+        )
+        with pytest.raises(ResponseShapeError, match="stopped paging by cursor"):
+            list(client.replay("1254468", T0, at(60)))
+
+
+def test_keyset_at_uses_the_token_and_a_cheap_window(client):
+    rows = [r for s in range(0, 3600, 60) for r in kpair(s)]
+    router, fake = serve_keyset(rows)
+    with router:
+        book = client.replay("1254468", T0, at(3600), outcome="Yes").at(at(1830))
+    assert book is not None and book.timestamp == at(1800) and book.token_id == "111"
+    assert len(fake.calls) == 1 and fake.calls[0]["token_id"] == "111"
+
+
+async def test_async_keyset_with_an_outcome(aclient):
+    rows = [r for s in range(0, 300, 30) for r in kpair(s)]
+    router, fake = serve_keyset(rows)
+    with router:
+        replay = aclient.replay("1254468", T0, at(600), outcome="No", page_size=4)
+        books = [b async for b in replay]
+        book = await replay.at(at(95))
+    assert [b.token_id for b in books] == ["222"] * 10
+    assert book is not None and book.timestamp == at(90)
+    assert all(c["token_id"] == "222" for c in fake.calls)
