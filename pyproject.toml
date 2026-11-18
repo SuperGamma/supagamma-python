@@ -114,8 +114,8 @@ warn_unreachable = true
 files = ["src/supagamma"]
 
 [[tool.mypy.overrides]]
-# pyarrow comes only with the optional `parquet`/`pandas` extras. CI type-checks
-# without it, and the code imports it defensively, so a missing module is expected
+# pyarrow and pandas come only with the optional `parquet`/`pandas` extras. CI type-checks
+# without them, and the code imports them defensively, so a missing module is expected
 # rather than an error.
-module = ["pyarrow", "pyarrow.*"]
+module = ["pyarrow", "pyarrow.*", "pandas", "pandas.*"]
 ignore_missing_imports = true

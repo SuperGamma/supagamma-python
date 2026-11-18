@@ -68,11 +68,15 @@ from ._errors import (  # noqa: E402
     ValidationError,
     WrongDataTypeError,
 )
+from .replay import AsyncReplay, BookState, Replay  # noqa: E402
 
 __all__ = [
     "__version__",
     "SupaGamma",
     "AsyncSupaGamma",
+    "Replay",
+    "AsyncReplay",
+    "BookState",
     "SupaGammaError",
     "SupaGammaConfigError",
     "MissingDependencyError",
