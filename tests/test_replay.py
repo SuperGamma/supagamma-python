@@ -209,8 +209,40 @@ def test_building_a_replay_sends_nothing(client):
 def test_a_large_page_size_warns_like_a_large_download(client):
     from supagamma.resources.download import CostWarning
 
-    with pytest.warns(CostWarning):
-        client.replay("1254468", T0, at(60), page_size=100_000)
+    router, _ = serve(pair(0))
+    with router, pytest.warns(CostWarning):
+        list(client.replay("1254468", T0, at(60), page_size=100_000))
+
+
+def test_the_confirm_cost_hook_is_read_live_and_sees_every_page(client, monkeypatch):
+    import warnings
+
+    from supagamma.resources import download
+
+    # Price every page above the warning line, so the hook is consulted on each.
+    monkeypatch.setattr(download, "COST_WARN_THRESHOLD_USD", 0.0)
+    seen: List[float] = []
+
+    def hook(usd: float) -> bool:
+        seen.append(usd)
+        return len(seen) < 2  # allow the first page, veto the second
+
+    replay = client.replay("1254468", T0, at(600), page_size=3)
+    rows = [r for s in range(0, 300, 30) for r in pair(s)]
+    router, fake = serve(rows)
+    monkeypatch.setattr(client.download, "confirm_cost", hook, raising=False)
+    with router, warnings.catch_warnings():  # set AFTER the replay was built
+        warnings.simplefilter("ignore", download.CostWarning)
+        with pytest.raises(RuntimeError, match="confirm_cost"):
+            list(replay)
+    assert len(seen) == 2
+    assert len(fake.calls) == 1
+
+
+def test_a_market_id_error_does_not_echo_the_id(client):
+    with pytest.raises(ValueError) as raised:
+        client.replay("sg_secret/x", T0, at(60))
+    assert "sg_secret" not in str(raised.value)
 
 
 # --- iteration and paging -------------------------------------------------------------
@@ -253,6 +285,26 @@ def test_paging_neither_skips_nor_repeats_a_snapshot(client, page_size):
     # Each page starts at the newest timestamp the previous one held.
     starts = [c["start"] for c in fake.calls]
     assert starts == sorted(starts)
+
+
+def test_a_row_written_out_of_order_after_the_cut_is_still_fetched(client):
+    # Storage order, not time order: the 60s tick was written before the 30s one.
+    # With page_size=4 the first page ends on a 60s row, so the next page starts
+    # at 60s... unless the cursor follows the LAST row in storage order.
+    rows = pair(0) + pair(60) + pair(30) + pair(90)
+    router, _ = serve(rows)
+    with router:
+        books = list(client.replay("1254468", T0, at(120), page_size=5))
+    stamps = sorted({b.timestamp for b in books})
+    assert stamps == [at(0), at(30), at(60), at(90)]
+    got = [(b.timestamp, b.token_id) for b in books]
+    assert got == sorted(got) and len(got) == len(set(got)) == 8
+
+
+def test_duplicate_price_levels_add_up():
+    raw = row(0)
+    raw["bids"] = json.dumps([{"price": "0.45", "size": "100"}, {"price": "0.450", "size": "50"}])
+    assert parse_row(raw).bids == ((0.45, 150.0),)
 
 
 def test_rows_out_of_order_within_a_page_are_sorted(client):
@@ -352,6 +404,24 @@ def test_a_long_rate_limit_wait_is_surfaced_not_slept(client):
     assert route.call_count == 1
 
 
+def test_a_too_many_concurrent_reads_429_is_transient_and_retried(client):
+    busy = {
+        "detail": {
+            "code": "too_many_concurrent_reads",
+            "message": "You already have 2 data reads in progress. You have not been charged.",
+        }
+    }
+    with respx.mock(base_url=BASE) as router:
+        route = router.get(PATH).mock(
+            side_effect=[
+                httpx.Response(429, json=busy, headers={"retry-after": "0"}),
+                httpx.Response(200, json=pair(0)),
+            ]
+        )
+        books = list(client.replay("1254468", T0, at(60)))
+    assert route.call_count == 2 and len(books) == 2
+
+
 def test_a_billing_quota_is_never_retried(client):
     with respx.mock(base_url=BASE) as router:
         route = router.get(PATH).mock(
@@ -448,6 +518,14 @@ def test_at_widens_its_lookback_without_re_reading_what_it_checked(client):
     for (lo, _), (_, hi) in zip(windows, windows[1:]):
         assert hi < lo
     assert windows[-1][0] == T0
+
+
+def test_at_with_an_outcome_the_market_lacks_stops_after_one_page(client):
+    replay = client.replay("1254468", T0, T0 + timedelta(hours=10), outcome="Yess")
+    router, fake = serve(pair(60) + [r for s in range(3600, 36000, 600) for r in pair(s)])
+    with router, pytest.raises(ValueError, match="Outcomes served"):
+        replay.at(T0 + timedelta(hours=9))
+    assert len(fake.calls) == 1
 
 
 def test_books_at_returns_every_outcome(client):

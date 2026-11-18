@@ -168,8 +168,10 @@ replay the per-update delta tape, because that is only served venue-wide.
 
 **It is metered.** Each page (`page_size`, default 2,500 rows, about 5 MB) is an
 orderbook download. It counts toward your fair-use volume and the download rate
-limit, and iterating twice downloads twice. A page the rate limiter refuses is
-waited out and retried, since nothing was served or charged. Nothing else is
+limit, and iterating twice downloads twice. `client.download.confirm_cost` and the
+cost warning are checked before every page, at the price of one page; the total
+depends on how many snapshots the window holds. A page the rate limiter refuses
+is waited out and retried, since nothing was served or charged. Nothing else is
 retried, and a billing quota (`QuotaExceededError`) never is. An empty window is an
 empty replay, not an error.
 
@@ -322,6 +324,9 @@ Pass `api_key` **or** `jwt`, never both — sending both makes the server silent
   `.to_pandas()`. Pages oldest first with flat memory; sync and async.
 - A billing quota (`QuotaExceededError`) is no longer retried by read policies
   that list 429. It used to fall through to the generic backoff.
+- The server's `too_many_concurrent_reads` 429 is now a `RateLimitError`, not a
+  `QuotaExceededError`: it is transient, sends a Retry-After, and is refused before
+  anything is charged, so the read policies retry it.
 
 **0.3.0**
 

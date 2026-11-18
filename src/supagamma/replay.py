@@ -142,22 +142,30 @@ class BookState:
 # --- input validation (pure) --------------------------------------------------
 
 
+def _parse_iso(text: str) -> Optional[datetime]:
+    """``datetime.fromisoformat`` that also takes a trailing ``Z``; None if unreadable."""
+    text = text.strip()
+    if text[-1:] in ("Z", "z"):
+        text = text[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return None
+
+
 def _parse_time(value: Any, name: str) -> datetime:
     """A caller's moment, as an aware UTC datetime. Naive input is refused.
 
     The message never repeats the value: it may have come from anywhere.
     """
+    parsed: Optional[datetime]
     if isinstance(value, str):
-        text = value.strip()
-        if text[-1:] in ("Z", "z"):
-            text = text[:-1] + "+00:00"
-        try:
-            parsed = datetime.fromisoformat(text)
-        except ValueError:
+        parsed = _parse_iso(value)
+        if parsed is None:
             raise ValueError(
                 f"{name} must be an ISO-8601 timestamp with a UTC offset, "
                 "e.g. '2026-11-01T12:00:00Z'."
-            ) from None
+            )
     elif isinstance(value, datetime):
         parsed = value
     else:
@@ -199,7 +207,13 @@ def _check_page_size(value: Any) -> int:
 def _check_market(value: Any) -> str:
     if not isinstance(value, str):
         raise TypeError("market_id must be a string (the market's markets.id).")
-    return _check_market_id(value.strip())
+    try:
+        return _check_market_id(value.strip())
+    except ValueError:
+        # The shared check quotes the id back; this path does not echo input.
+        raise ValueError(
+            "market_id must be a non-empty markets.id without '/', e.g. '1254468'."
+        ) from None
 
 
 # --- response parsing (pure) ----------------------------------------------------
@@ -207,14 +221,11 @@ def _check_market(value: Any) -> str:
 
 def _row_time(value: Any) -> datetime:
     """A stored row timestamp. The capture writes ``isoformat()`` of UTC."""
+    parsed: Optional[datetime]
     if isinstance(value, str):
-        text = value.strip()
-        if text[-1:] in ("Z", "z"):
-            text = text[:-1] + "+00:00"
-        try:
-            parsed = datetime.fromisoformat(text)
-        except ValueError:
-            raise ResponseShapeError("an orderbook row carried an unreadable timestamp") from None
+        parsed = _parse_iso(value)
+        if parsed is None:
+            raise ResponseShapeError("an orderbook row carried an unreadable timestamp")
     elif isinstance(value, datetime):
         parsed = value
     else:
@@ -229,7 +240,8 @@ def _levels(raw: Any, side: str) -> Tuple[Level, ...]:
 
     The capture stores each side as a JSON string of ``{price, size}`` objects
     (strings, as the venue sends them); some files hold real arrays. Both are
-    accepted, as are ``[price, size]`` pairs. Zero-size levels are dropped.
+    accepted, as are ``[price, size]`` pairs. Zero-size levels are dropped, and
+    two entries at the same price add up.
     """
     if raw is None:
         return ()
@@ -257,7 +269,7 @@ def _levels(raw: Any, side: str) -> Tuple[Level, ...]:
         if not (math.isfinite(price) and math.isfinite(size)):
             raise ResponseShapeError(f"an orderbook row held a non-finite {side} level")
         if size > 0:
-            book[price] = size
+            book[price] = book.get(price, 0.0) + size
     return tuple(sorted(book.items(), reverse=(side == "bid")))
 
 
@@ -287,13 +299,16 @@ class _Pager:
     """Walks ``[start, end]`` one page at a time, oldest first, with no gaps or repeats.
 
     The route has no cursor, only ``start``/``end``/``limit``, and returns the
-    *earliest* ``limit`` rows of the window (files are read in date order). So
-    when a page comes back full, the rows at its newest timestamp are held back
-    (the cut may have split that capture tick) and the next page starts AT that
-    timestamp; the bound is inclusive, so the whole tick arrives together on the
-    next page. Every capture tick is therefore yielded once, complete, in
-    ``(timestamp, token_id)`` order. A row older than the cursor (a late,
-    out-of-order capture write) is dropped rather than yielded out of order.
+    *first* ``limit`` matching rows in storage order (day files in date order,
+    rows in the order they were written), not sorted by time. So when a page
+    comes back full, the next page starts AT the timestamp of the page's LAST
+    row in storage order, and every row at or after that timestamp is held back
+    for it (the bound is inclusive, so a capture tick split by the cut arrives
+    whole on the next page). Using the last row rather than the newest one means
+    a row written out of order after the cut is still fetched, unless it is
+    older than that last row. Such a row (a late capture write) is dropped
+    rather than yielded out of order. Ticks are yielded once each, in
+    ``(timestamp, token_id)`` order.
     """
 
     def __init__(self, market_id: str, start: datetime, end: datetime, page_size: int) -> None:
@@ -328,15 +343,17 @@ class _Pager:
             self.done = True
             return fresh
 
-        newest = max(s.timestamp for s in states)
-        if newest <= self.cursor:
+        nxt = states[-1].timestamp
+        if nxt <= self.cursor:
+            nxt = max(s.timestamp for s in states)
+        if nxt <= self.cursor:
             # A full page, all at the cursor: the next request would be identical.
             raise SupaGammaError(
                 f"page_size={self.page_size} is too small: a full page held a single "
                 "timestamp, so the replay cannot move past it. Raise page_size."
             )
-        self.cursor = newest
-        return [s for s in fresh if s.timestamp < newest]
+        self.cursor = nxt
+        return [s for s in fresh if s.timestamp < nxt]
 
 
 # --- the interval grid (pure) ----------------------------------------------------
@@ -394,7 +411,6 @@ class _ReplayBase:
         token_id: Optional[str],
         interval: Optional[IntervalLike],
         page_size: int,
-        confirm_cost: Any,
     ) -> None:
         self.market_id = _check_market(market_id)
         self.start = _parse_time(start, "start")
@@ -411,9 +427,23 @@ class _ReplayBase:
         self.token_id = token_id.strip() if token_id is not None else None
         self.interval = _parse_interval(interval)
         self.page_size = _check_page_size(page_size)
-        # Warns (or lets the confirm_cost hook veto) before any request, exactly
-        # as a single download of page_size rows would.
-        _maybe_warn_cost(self.page_size, "orderbook", confirm_cost)
+
+    def _before_page(self, download: Any) -> None:
+        """The cost check every download makes, run before EACH page.
+
+        Reads ``client.download.confirm_cost`` at the time, so a hook set after
+        the replay was built still applies, and it sees every page, not just the
+        first. It prices one page (``page_size`` rows): the replay's total is
+        not known until the window has been walked.
+        """
+        _maybe_warn_cost(self.page_size, "orderbook", getattr(download, "confirm_cost", None))
+
+    def _check_page(self, served: Set[str], matched: bool) -> None:
+        # Pages carry whole capture ticks, and a tick holds every outcome, so a
+        # page that served rows and matched none means the filter matches
+        # nothing. Stop now instead of downloading the rest of the window.
+        if served and not matched:
+            raise self._no_match(served)
 
     def _wanted(self, state: BookState) -> bool:
         if self.token_id is not None:
@@ -522,17 +552,15 @@ class Replay(_ReplayBase):
             token_id=token_id,
             interval=interval,
             page_size=page_size,
-            confirm_cost=getattr(client.download, "confirm_cost", None),
         )
 
-    def _fetch(
-        self, start: datetime, end: datetime, *, check_match: bool = True
-    ) -> Iterator[BookState]:
+    def _fetch(self, start: datetime, end: datetime) -> Iterator[BookState]:
         pager = _Pager(self.market_id, start, end, self.page_size)
         served: Set[str] = set()
         matched = False
         while not pager.done:
             method, path, params, policy = pager.call()
+            self._before_page(self._client.download)
             try:
                 response = self._client.request(method, path, params=params, policy=policy)
             except NoDataInRangeError:
@@ -550,8 +578,7 @@ class Replay(_ReplayBase):
                 if self._wanted(state):
                     matched = True
                     yield state
-        if check_match and served and not matched:
-            raise self._no_match(served)
+            self._check_page(served, matched)
 
     def snapshots(self) -> Iterator[BookState]:
         """Every snapshot in the window, oldest first (ignores ``interval``)."""
@@ -574,15 +601,18 @@ class Replay(_ReplayBase):
 
         Looks back ``lookback`` first and doubles the step, never before
         ``start``, until a window holds a snapshot. Returns ``{}`` when nothing
-        precedes ``when`` inside the replay window. Keyed by ``token_id``. An
-        outcome that was not captured in the window that answered is absent.
+        precedes ``when`` inside the replay window. Keyed by ``token_id``. The
+        capture snapshots every outcome of a market on the same tick, so all of
+        them normally answer together; an outcome missing from the window that
+        answered (a capture gap) is absent rather than searched for further back.
+        A filter that matches nothing raises ``ValueError`` after the first page.
         """
         hi = self._target(when)
         span = self._lookback(lookback)
         while True:
             lo = max(self.start, hi - span)
             latest: Dict[str, BookState] = {}
-            for state in self._fetch(lo, hi, check_match=False):
+            for state in self._fetch(lo, hi):
                 latest[state.token_id] = state
             if latest or lo <= self.start:
                 return latest
@@ -640,17 +670,15 @@ class AsyncReplay(_ReplayBase):
             token_id=token_id,
             interval=interval,
             page_size=page_size,
-            confirm_cost=getattr(client.download, "confirm_cost", None),
         )
 
-    async def _fetch(
-        self, start: datetime, end: datetime, *, check_match: bool = True
-    ) -> AsyncIterator[BookState]:
+    async def _fetch(self, start: datetime, end: datetime) -> AsyncIterator[BookState]:
         pager = _Pager(self.market_id, start, end, self.page_size)
         served: Set[str] = set()
         matched = False
         while not pager.done:
             method, path, params, policy = pager.call()
+            self._before_page(self._client.download)
             try:
                 response = await self._client.request(method, path, params=params, policy=policy)
             except NoDataInRangeError:
@@ -668,8 +696,7 @@ class AsyncReplay(_ReplayBase):
                 if self._wanted(state):
                     matched = True
                     yield state
-        if check_match and served and not matched:
-            raise self._no_match(served)
+            self._check_page(served, matched)
 
     def snapshots(self) -> AsyncIterator[BookState]:
         """Every snapshot in the window, oldest first (ignores ``interval``)."""
@@ -696,7 +723,7 @@ class AsyncReplay(_ReplayBase):
         while True:
             lo = max(self.start, hi - span)
             latest: Dict[str, BookState] = {}
-            async for state in self._fetch(lo, hi, check_match=False):
+            async for state in self._fetch(lo, hi):
                 latest[state.token_id] = state
             if latest or lo <= self.start:
                 return latest

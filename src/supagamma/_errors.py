@@ -433,6 +433,11 @@ _BY_CODE: Dict[str, type] = {
     "invalid_timeframe": WrongDataTypeError,
     "missing_market_id": MissingIdentifierError,
     "missing_series_id": MissingIdentifierError,
+    # A 429 with a dict detail that is NOT a billing quota: the caller already
+    # has the per-caller maximum of storage reads in flight. The server refuses
+    # it before reading or charging anything and sends a Retry-After, so it is
+    # the transient kind.
+    "too_many_concurrent_reads": RateLimitError,
 }
 
 _BY_STATUS: Dict[int, type] = {
