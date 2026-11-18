@@ -37,6 +37,7 @@ from ._errors import (
     APIConnectionError,
     APIStatusError,
     APITimeoutError,
+    QuotaExceededError,
     RateLimitError,
     ServiceUnavailableError,
     SupaGammaConfigError,
@@ -44,6 +45,7 @@ from ._errors import (
 )
 
 if TYPE_CHECKING:  # pragma: no cover - annotations only; no runtime import cycle
+    from .replay import AsyncReplay, IntervalLike, Replay, TimeLike
     from .resources.account import Account, AsyncAccount
     from .resources.billing import AsyncBilling, Billing
     from .resources.download import AsyncDownload, Download
@@ -237,6 +239,11 @@ class BaseClient:
         class from `RateLimitError` precisely so this function cannot confuse a
         billing cap with a rate limit.
         """
+        if isinstance(exc, QuotaExceededError):
+            # A billing cap shares status 429 with the limiter. Without this
+            # check, a policy that lists 429 fell through to the generic backoff
+            # below and retried a cap that cannot clear before the period ends.
+            return None
         if exc.status_code not in policy.on_status:
             if exc.status_code >= 500 and policy.on_server_error_once and attempt == 0:
                 return _backoff(attempt)
@@ -407,6 +414,37 @@ class SupaGamma(BaseClient):
         finally:
             response.close()
 
+    def replay(
+        self,
+        market_id: str,
+        start: TimeLike,
+        end: TimeLike,
+        *,
+        outcome: Optional[str] = None,
+        token_id: Optional[str] = None,
+        interval: Optional[IntervalLike] = None,
+        page_size: int = 2_500,
+    ) -> Replay:
+        """Rebuild a market's L2 order book over ``[start, end]``.
+
+        Returns a :class:`~supagamma.replay.Replay`: iterate it for books, oldest
+        first, or call ``.at(when)`` for the book at one moment. Nothing is sent
+        until you do. Every page is a metered orderbook download; see
+        :mod:`supagamma.replay`.
+        """
+        from .replay import Replay
+
+        return Replay(
+            self,
+            market_id,
+            start,
+            end,
+            outcome=outcome,
+            token_id=token_id,
+            interval=interval,
+            page_size=page_size,
+        )
+
     def get_json(self, path: str, **kw: Any) -> Any:
         return self.request("GET", path, **kw).json()
 
@@ -552,6 +590,35 @@ class AsyncSupaGamma(BaseClient):
             yield response
         finally:
             await response.aclose()
+
+    def replay(
+        self,
+        market_id: str,
+        start: TimeLike,
+        end: TimeLike,
+        *,
+        outcome: Optional[str] = None,
+        token_id: Optional[str] = None,
+        interval: Optional[IntervalLike] = None,
+        page_size: int = 2_500,
+    ) -> AsyncReplay:
+        """Async twin of :meth:`SupaGamma.replay`.
+
+        Returns an :class:`~supagamma.replay.AsyncReplay`: ``async for`` over it,
+        or ``await replay.at(when)``. Nothing is sent until you do.
+        """
+        from .replay import AsyncReplay
+
+        return AsyncReplay(
+            self,
+            market_id,
+            start,
+            end,
+            outcome=outcome,
+            token_id=token_id,
+            interval=interval,
+            page_size=page_size,
+        )
 
     async def get_json(self, path: str, **kw: Any) -> Any:
         return (await self.request("GET", path, **kw)).json()

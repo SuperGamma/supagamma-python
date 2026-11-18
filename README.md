@@ -42,6 +42,7 @@ Create one in your [dashboard](https://supagamma.com/dashboard/api-keys). Keys l
 | `client.account` | Identity, usage, API keys, GDPR export |
 | `client.system` | `/health`, platform stats |
 | `client.public_markets` | Public market metadata (usually disabled) |
+| `client.replay(...)` | Rebuild a market's L2 order book at any moment (metered) |
 
 ## Typed responses
 
@@ -123,6 +124,67 @@ example lives in [`examples/calibration.py`](examples/calibration.py).
 It's a research tool, not investment advice, and makes no performance promise:
 it shows what *did* happen in historical data. Fees, liquidity, and slippage make
 live results different.
+
+## Order-book replay
+
+`client.replay(market_id, start, end)` rebuilds a market's full-depth L2 book over a
+window, so you can see what the book looked like at any moment without parsing
+snapshot files yourself:
+
+```python
+from supagamma import SupaGamma
+
+client = SupaGamma(api_key="sg_...")
+replay = client.replay(
+    "1254468",
+    start="2026-11-01T12:00:00Z",   # or a timezone-aware datetime
+    end="2026-11-01T13:00:00Z",
+    outcome="Yes",                  # or token_id=...; omit for every outcome
+)
+
+for book in replay:                 # oldest first, one page at a time
+    print(book.timestamp, book.best_bid, book.best_ask, book.spread)
+
+book = replay.at("2026-11-01T12:30:00Z")   # newest snapshot at or before that moment
+book.bids[:5]                               # [(price, size), ...], best first
+```
+
+- Each `BookState` has `timestamp`, `token_id`, `outcome`, `bids` (highest first),
+  `asks` (lowest first), `snapshot_time`, and `best_bid` / `best_ask` / `mid` /
+  `spread`.
+- `interval=60` (seconds, or a `timedelta`) puts the books on a fixed grid from
+  `start` to `end`. Each tick shows the newest snapshot at or before it, and
+  `snapshot_time` tells you how old that snapshot is.
+- `at(when)` returns `None` when no snapshot comes before `when` inside the
+  window, and raises `ValueError` for a `when` outside `[start, end]`. It needs one
+  outcome (`outcome=` or `token_id=`); `books_at(when)` returns every outcome,
+  keyed by token id.
+- `to_pandas()` returns one row per price level (`pip install "supagamma[pandas]"`).
+  It is the only call that holds the whole window in memory.
+
+Replay reads the market's captured L2 **snapshots** (`GET /v1/download/orderbook`),
+every 5 s to 15 min depending on how close the market is to expiry. It does not
+replay the per-update delta tape, because that is only served venue-wide.
+
+Where the API supports it, replay pages with the server's cursor (`paginate=true`)
+and asks for one outcome's rows only (`token_id`). An `outcome=` name is turned
+into its token id with one `client.markets.get` call. On an API without those
+parameters, replay pages by time and filters outcomes after download instead;
+the first response decides which. The cursor is the more complete of the two: time
+paging needs a `page_size` larger than one capture tick, and cannot reach a row the
+capture wrote late, behind a page it has already passed.
+
+**It is metered.** Each page (`page_size`, default 2,500 rows, about 5 MB) is an
+orderbook download. It counts toward your fair-use volume and the download rate
+limit, and iterating twice downloads twice. With the server-side outcome filter
+only the outcome you asked for is metered; without it (an older API, or an outcome
+that cannot be mapped to a token id) every outcome's rows are fetched and metered. The cost warning and `client.download.confirm_cost` are
+checked before every page against the running total, so a long replay of small
+pages still warns (once) and still asks the hook. `at()` downloads only a short
+window before `when` (5 minutes first, doubling until a snapshot turns up). A page the rate limiter refuses
+is waited out and retried, since nothing was served or charged. Nothing else is
+retried, and a billing quota (`QuotaExceededError`) never is. An empty window is an
+empty replay, not an error.
 
 ## Big pulls: stream to disk, or export
 
@@ -265,6 +327,17 @@ SupaGamma(
 Pass `api_key` **or** `jwt`, never both — sending both makes the server silently use the key and ignore the JWT, so the SDK refuses it up front.
 
 ## Changes
+
+**Unreleased**
+
+- `client.replay(market_id, start, end)`: order-book replay over
+  `/v1/download/orderbook`, with `.at()`, `.books_at()`, an `interval=` grid and
+  `.to_pandas()`. Pages oldest first with flat memory; sync and async.
+- A billing quota (`QuotaExceededError`) is no longer retried by read policies
+  that list 429. It used to fall through to the generic backoff.
+- The server's `too_many_concurrent_reads` 429 is now a `RateLimitError`, not a
+  `QuotaExceededError`: it is transient, sends a Retry-After, and is refused before
+  anything is charged, so the read policies retry it.
 
 **0.3.0**
 
